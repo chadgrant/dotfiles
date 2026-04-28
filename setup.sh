@@ -13,6 +13,8 @@ sudo dpkg-reconfigure -f noninteractive tzdata
 
 sudo apt-get install git curl keychain openssh-server apt-transport-https ca-certificates software-properties-common build-essential unzip jq zsh -y
 
+printf '\n\nSetting up SSH ...\n\n'
+
 mkdir -p "$TARGET_HOME/.ssh"
 chmod 700 "$TARGET_HOME/.ssh"
 
@@ -25,7 +27,6 @@ EXPECTED_HASH="b1ba3f7c085369a270d415a33047515763528e42687241a5027c752af7435d33"
 curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/id_rsa.pub -o /tmp/pubkey
 echo "$EXPECTED_HASH  /tmp/pubkey" | sha256sum -c || exit 1
 mv /tmp/pubkey "$TARGET_HOME/.ssh/id_rsa.pub"
-
 
 echo "Paste your private key. End with a blank line."
 
@@ -56,7 +57,15 @@ if ! ssh-add -l >/dev/null 2>&1; then
   ssh-add "$TARGET_HOME/.ssh/id_rsa"
 fi
 
+#configure keychain
+
+echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
+
+
 #configure git
+
+printf '\n\nConfiguring Git ...\n\n'
+
 read -rp "Enter your Git email: " GIT_EMAIL
 
 git config --global user.name "Chad Grant"
@@ -64,26 +73,28 @@ git config --global user.email "$GIT_EMAIL"
 git config --global core.editor "nano"
 #git config --global url."git@github.com:".insteadOf "https://github.com/"
 
-#configure keychain
-
-echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
-
 
 #install xh
+printf '\n\nInstalling xh ...\n\n'
 
-echo "installing xh"
-mkdir -p "$TARGET_HOME/bin"
+sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/bin"
 XH_VERSION=$(curl -fsSL https://api.github.com/repos/ducaale/xh/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
 if [ $(uname) = "Linux" ]; then
-  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz -C "$TARGET_HOME/bin" --strip-components=1
+  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
 elif [ $(uname) = "Darwin" ]; then
-  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-apple-darwin.tar.gz | tar xz -C "$TARGET_HOME/bin" --strip-components=1
+  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-apple-darwin.tar.gz | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
+fi
+
+# Persist ~/bin on PATH for login shells
+if ! grep -q 'HOME/bin' /etc/profile; then
+  echo 'export PATH="$HOME/bin:$PATH"' | sudo tee -a /etc/profile >/dev/null
 fi
 
 # install eza
 
-echo "installing eza"
+printf '\n\nInstalling eza ...\n\n'
+
 sudo mkdir -p /etc/apt/keyrings
 wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
 echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | sudo tee /etc/apt/sources.list.d/gierens.list
@@ -92,6 +103,8 @@ sudo apt update && sudo apt install -y eza
 
 
 #install docker
+
+printf '\n\nInstalling docker ...\n\n'
 
 sudo install -m 0755 -d /etc/apt/keyrings && \
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
@@ -108,33 +121,42 @@ sudo groupadd -f docker
 sudo usermod -aG docker "$TARGET_USER"
 
 #install dir env
+
+printf '\n\nInstalling direnv ...\n\n'
+
 curl -sfL https://direnv.net/install.sh | sudo bin_path=/usr/local/bin bash
-sudo echo '#DIRENV HOOK' >> ~/.bashrc
-sudo echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+if ! grep -q 'direnv hook bash' "$TARGET_HOME/.bashrc" 2>/dev/null; then
+  sudo -u "$TARGET_USER" tee -a "$TARGET_HOME/.bashrc" >/dev/null <<'EOF'
+
+# direnv hook
+eval "$(direnv hook bash)"
+EOF
+fi
 
 #install kubectl 
+
+printf '\n\nInstalling kubectl ...\n\n'
+
 VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -LO "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
+curl -fsSLO "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
 chmod +x kubectl
 sudo mv kubectl /usr/local/bin/kubectl
 
-#!/usr/bin/env bash
-set -e
-
 # Install Node
 
-# Install nvm (if not already installed)
+printf '\n\nInstalling node ...\n\n'
+
+read -rp "Enter Node version (e.g. 20, 18.17.1). Leave empty for latest: " NODE_VERSION
+
+# Install nvm + node + bun as the target user so they land in $TARGET_HOME
+sudo -u "$TARGET_USER" HOME="$TARGET_HOME" NODE_VERSION="$NODE_VERSION" bash <<'EOF'
+set -e
 if [ ! -d "$HOME/.nvm" ]; then
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 fi
-
-# Load nvm into current shell
 export NVM_DIR="$HOME/.nvm"
 # shellcheck disable=SC1090
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-
-# Prompt for Node version
-read -rp "Enter Node version (e.g. 20, 18.17.1). Leave empty for latest: " NODE_VERSION
+. "$NVM_DIR/nvm.sh"
 
 if [ -z "$NODE_VERSION" ]; then
   echo "Installing latest Node..."
@@ -143,25 +165,21 @@ else
   echo "Installing Node version $NODE_VERSION..."
   nvm install "$NODE_VERSION"
 fi
-
-# Set default
 nvm alias default "$(nvm current)"
-
-# Verify
-node -v
-npm -v
 
 # Install Bun (latest)
 curl -fsSL https://bun.sh/install | bash
-
-# Load bun into PATH for current session
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 
-# Verify
+node -v
+npm -v
 bun --version
+EOF
 
 #install golang
+
+printf '\n\nInstalling golang ...\n\n'
 
 ARCH="linux-amd64"
 INSTALL_DIR="/usr/local"
@@ -176,48 +194,63 @@ GO_VERSION="${GO_VERSION:-$LATEST_VERSION}"
 TARBALL="${GO_VERSION}.${ARCH}.tar.gz"
 URL="https://go.dev/dl/${TARBALL}"
 echo "Installing $GO_VERSION..."
-curl -fLO "$URL"
+curl -fsSLO "$URL"
 sudo rm -rf "${INSTALL_DIR}/go"
 sudo tar -C "$INSTALL_DIR" -xzf "$TARBALL"
 rm -f "$TARBALL"
-mkdir -p "$TARGET_HOME/go/bin"
+sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/go/bin"
 
 if ! grep -q "/usr/local/go/bin" /etc/profile; then
-  echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' | sudo tee -a /etc/profile >/dev/null
+  echo 'export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"' | sudo tee -a /etc/profile >/dev/null
 fi
-export PATH=$PATH:/usr/local/go/bin
-export PATH=$PATH:$TARGET_HOME/go/bin
+export PATH="$PATH:/usr/local/go/bin:$TARGET_HOME/go/bin"
 
 go version
 
 #install dotnet
 
-curl -L https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
-bash dotnet-install.sh --channel 10.0
-rm -f dotnet-install.sh
+printf '\n\nInstalling dotnet ...\n\n'
 
-echo 'export PATH=$PATH:$HOME/.dotnet:$HOME/.dotnet/tools' | sudo tee -a /etc/profile >/dev/null
-export DOTNET_ROOT=$TARGET_HOME/.dotnet
-export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
+sudo -u "$TARGET_USER" HOME="$TARGET_HOME" bash <<'EOF'
+set -e
+curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+bash /tmp/dotnet-install.sh --channel 10.0
+rm -f /tmp/dotnet-install.sh
+EOF
+
+if ! grep -q 'DOTNET_ROOT' /etc/profile; then
+  echo 'export DOTNET_ROOT="$HOME/.dotnet"' | sudo tee -a /etc/profile >/dev/null
+  echo 'export PATH="$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools"' | sudo tee -a /etc/profile >/dev/null
+fi
+export DOTNET_ROOT="$TARGET_HOME/.dotnet"
+export PATH="$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools"
 
 #install fzf
+
+printf '\n\nInstalling fzf ...\n\n'
+
 FZF_VERSION=$(curl -fsSL https://api.github.com/repos/junegunn/fzf/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
 
-curl -LO "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz" && \
+curl -fsSLO "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz" && \
 tar -xvf fzf-*.tar.gz && \
 sudo mv fzf /usr/local/bin/fzf && \
 rm -f fzf-*.tar.gz
 
 #install fd
+
+printf '\n\nInstalling fd ...\n\n'
+
 FD_VERSION=$(curl -fsSL https://api.github.com/repos/sharkdp/fd/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
 
-curl -LO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd_${FD_VERSION}_amd64.deb" && \
+curl -fsSLO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd_${FD_VERSION}_amd64.deb" && \
 sudo dpkg -i fd_*.deb && \
 rm -f fd_*.deb
 
 #setup zsh
+
+printf '\n\nConfiguring zsh ...\n\n'
 
 ZDOTDIR="${ZDOTDIR:-$TARGET_HOME}"
 
@@ -263,8 +296,13 @@ sudo -u "$TARGET_USER" tee "$TARGET_HOME/.zshrc" >/dev/null <<'EOF'
 source ~/Documents/chadgrant/dotfiles/zshrc
 EOF
 
-# zsh completions
-git clone https://github.com/zsh-users/zsh-completions.git ~/.zsh/zsh-completions
-curl -sfL https://raw.githubusercontent.com/jqlang/jq/master/jq.zsh -o ~/.zsh/completions/_jq
-git clone https://github.com/zsh-users/zsh-autosuggestions.git ~/.zsh/zsh-autosuggestions
-git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ~/.zsh/zsh-syntax-highlighting
+printf '\n\nInstalling zsh completions ...\n\n'
+
+# zsh completions (run as target user so files land in $TARGET_HOME with correct ownership)
+sudo -u "$TARGET_USER" HOME="$TARGET_HOME" bash <<'EOF'
+set -e
+mkdir -p "$HOME/.zsh/completions"
+[ -d "$HOME/.zsh/zsh-completions" ]        || git clone https://github.com/zsh-users/zsh-completions.git "$HOME/.zsh/zsh-completions"
+[ -d "$HOME/.zsh/zsh-autosuggestions" ]    || git clone https://github.com/zsh-users/zsh-autosuggestions.git "$HOME/.zsh/zsh-autosuggestions"
+[ -d "$HOME/.zsh/zsh-syntax-highlighting" ]|| git clone https://github.com/zsh-users/zsh-syntax-highlighting.git "$HOME/.zsh/zsh-syntax-highlighting"
+EOF

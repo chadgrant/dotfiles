@@ -128,6 +128,19 @@ fi
 
 export PATH="$HOME/bin:$PATH"
 
+# nvm
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+[ -d "$BUN_INSTALL/bin" ] && export PATH="$BUN_INSTALL/bin:$PATH"
+
+# dotnet
+export DOTNET_ROOT="$HOME/.dotnet"
+[ -d "$DOTNET_ROOT" ] && export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
+
 eval "$(direnv hook zsh)"
 
 #bat
@@ -385,27 +398,20 @@ if [ "${WSL_DISTRO_NAME}x" != "x" ]; then
   fi
 fi
 
-unalias documents chadgrant icanotes 2>/dev/null
+unalias documents 2>/dev/null
 alias documents='cd $DOC_ROOT'
 
-alias chadgrant='cd $DOC_ROOT/chadgrant'
-for d in $DOC_ROOT/chadgrant/*
-do
-  dir=$(basename $d)
-  if [ -d "${d}" ]; then
+DOC_DIRS=(chadgrant icanotes shipt playstudios spree)
+for parent in $DOC_DIRS; do
+  [ -d "$DOC_ROOT/$parent" ] || continue
+  unalias $parent 2>/dev/null
+  alias $parent="cd $DOC_ROOT/$parent"
+  for d in $DOC_ROOT/$parent/*(N); do
+    [ -d "$d" ] || continue
+    dir=$(basename $d)
     unalias $dir 2>/dev/null
-    alias $dir="cd $DOC_ROOT/chadgrant/$dir"
-  fi
-done
-
-alias icanotes='cd $DOC_ROOT/icanotes'
-for d in $DOC_ROOT/icanotes/*
-do
-  dir=$(basename $d)
-  if [ -d "${d}" ]; then
-    unalias $dir 2>/dev/null
-    alias $dir="cd $DOC_ROOT/icanotes/$dir"
-  fi
+    alias $dir="cd $DOC_ROOT/$parent/$dir"
+  done
 done
 
 unalias goproxy 2>/dev/null
