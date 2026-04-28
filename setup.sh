@@ -1,32 +1,60 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 
 sudo apt-get update
 sudo apt-get upgrade -y
+
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils tzdata
+sudo ln -sf /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+sudo dpkg-reconfigure -f noninteractive tzdata
+
 sudo apt-get install git curl keychain openssh-server apt-transport-https ca-certificates software-properties-common build-essential unzip jq zsh -y
 
-mkdir ~/.ssh/
-chmod 700 ~/.ssh
+mkdir -p "$TARGET_HOME/.ssh"
+chmod 700 "$TARGET_HOME/.ssh"
 
 EXPECTED_HASH="d643d716d3634675fdc037e9434bb6f9cd66eb203b7a0cc8af3399a5112845fe"
-curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/main/authorized_keys -o /tmp/ak
+curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/authorized_keys -o /tmp/ak
 echo "$EXPECTED_HASH  /tmp/ak" | sha256sum -c || exit 1
-mv /tmp/ak ~/.ssh/authorized_keys
+mv /tmp/ak "$TARGET_HOME/.ssh/authorized_keys"
 
 EXPECTED_HASH="b1ba3f7c085369a270d415a33047515763528e42687241a5027c752af7435d33"
-curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/main/id_rsa.pub -o /tmp/pubkey
+curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/id_rsa.pub -o /tmp/pubkey
 echo "$EXPECTED_HASH  /tmp/pubkey" | sha256sum -c || exit 1
-mv /tmp/pubkey ~/.ssh/id_rsa.pub
+mv /tmp/pubkey "$TARGET_HOME/.ssh/id_rsa.pub"
 
 
+echo "Paste your private key. End with a blank line."
 
-echo "Paste your private key. Press Ctrl-D when finished:"
-umask 077
-cat > ~/.ssh/id_rsa
+awk '
+  NF == 0 { exit }
+  { print }
+' | sed 's/\r$//' > /tmp/raw_ssh_key
 
-chmod 600 ~/.ssh/authorized_keys
-chmod 644 ~/.ssh/*.pub
-chmod 600 ~/.ssh/id_rsa
+awk '
+  /-----BEGIN OPENSSH PRIVATE KEY-----/ { inkey=1 }
+  inkey { print }
+  /-----END OPENSSH PRIVATE KEY-----/ { exit }
+' /tmp/raw_ssh_key > "$TARGET_HOME/.ssh/id_rsa"
+
+chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+chmod 600 $TARGET_HOME/.ssh/authorized_keys
+chmod 600 $TARGET_HOME/.ssh/id_*
+chmod 644 $TARGET_HOME/.ssh/*.pub
+
 sudo service ssh restart
+
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+  eval "$(ssh-agent -s)"
+fi
+
+# Add the target user's key to this agent
+if ! ssh-add -l >/dev/null 2>&1; then
+  ssh-add "$TARGET_HOME/.ssh/id_rsa"
+fi
 
 #configure git
 read -rp "Enter your Git email: " GIT_EMAIL
@@ -34,11 +62,11 @@ read -rp "Enter your Git email: " GIT_EMAIL
 git config --global user.name "Chad Grant"
 git config --global user.email "$GIT_EMAIL"
 git config --global core.editor "nano"
-git config --global url."git@github.com:".insteadOf "https://github.com/"
+#git config --global url."git@github.com:".insteadOf "https://github.com/"
 
 #configure keychain
 
-echo "eval \`keychain --eval --agents ssh id_rsa\`" >> ~/.bash_profile
+echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
 
 #install docker
 
@@ -50,12 +78,14 @@ echo \
   $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
 sudo apt-get update && \
-sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
-sudo groupadd docker 2> /dev/null || true && \
-sudo usermod -aG docker $USER
+sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+
+
+sudo groupadd -f docker
+sudo usermod -aG docker "$TARGET_USER"
 
 #install dir env
-curl -sfL https://direnv.net/install.sh | bash
+curl -sfL https://direnv.net/install.sh | sudo bin_path=/usr/local/bin bash
 sudo echo '#DIRENV HOOK' >> ~/.bashrc
 sudo echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
 
@@ -125,32 +155,48 @@ curl -LO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd_${FD
 sudo dpkg -i fd_*.deb && \
 rm -f fd_*.deb
 
-
 #setup zsh
 
-zsh 
+ZDOTDIR="${ZDOTDIR:-$TARGET_HOME}"
 
-#do nothing
+# Install prezto if missing
+if [ ! -d "$ZDOTDIR/.zprezto" ]; then
+  sudo -u "$TARGET_USER" \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    git clone --recursive https://github.com/sorin-ionescu/prezto.git "$ZDOTDIR/.zprezto"
+fi
 
-git clone --recursive https://github.com/sorin-ionescu/prezto.git "${ZDOTDIR:-$HOME}/.zprezto"
+# Create Prezto symlinks as target user
+sudo -u "$TARGET_USER" ZDOTDIR="$ZDOTDIR" zsh -c '
+  setopt EXTENDED_GLOB
+  for rcfile in "$ZDOTDIR"/.zprezto/runcoms/^README.md(.N); do
+    target="$ZDOTDIR/.${rcfile:t}"
+    [ -e "$target" ] || ln -s "$rcfile" "$target"
+  done
+'
 
-#Create a new Zsh configuration by copying the Zsh configuration files provided:
-
-setopt EXTENDED_GLOB
-for rcfile in "${ZDOTDIR:-$HOME}"/.zprezto/runcoms/^README.md(.N); do
-  ln -s "$rcfile" "${ZDOTDIR:-$HOME}/.${rcfile:t}"
-done
-
-#Set Zsh as your default shell:
-
+# Set login shell
 ZSH_PATH="$(command -v zsh)"
+grep -qxF "$ZSH_PATH" /etc/shells || echo "$ZSH_PATH" | sudo tee -a /etc/shells >/dev/null
+sudo chsh -s "$ZSH_PATH" "$TARGET_USER"
 
-chsh -s "$ZSH_PATH" "$USER"
+# Dotfiles
+sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/Documents/chadgrant"
 
-mkdir -p ~/Documents/chadgrant && ln -s ~/Documents documents
+if [ ! -e "$TARGET_HOME/documents" ]; then
+  sudo -u "$TARGET_USER" ln -s "$TARGET_HOME/Documents" "$TARGET_HOME/documents"
+fi
 
-git clone git@github.com:chadgrant/dotfiles.git ~/Documents/chadgrant/dotfiles
+if [ ! -d "$TARGET_HOME/Documents/chadgrant/dotfiles" ]; then
+  sudo -u "$TARGET_USER" \
+  HOME="$TARGET_HOME" \
+  SSH_AUTH_SOCK="$SSH_AUTH_SOCK" \
+  GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
+  git clone git@github.com:chadgrant/dotfiles.git \
+  "$TARGET_HOME/Documents/chadgrant/dotfiles"
+fi
 
-echo 'source ~/Documents/chadgrant/dotfiles/zshrc' > ~/.zshrc
-
-source ~/.zshrc
+sudo -u "$TARGET_USER" tee "$TARGET_HOME/.zshrc" >/dev/null <<'EOF'
+source ~/Documents/chadgrant/dotfiles/zshrc
+EOF
