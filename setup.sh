@@ -68,6 +68,29 @@ git config --global core.editor "nano"
 
 echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
 
+
+#install xh
+
+echo "installing xh"
+mkdir -p "$TARGET_HOME/bin"
+XH_VERSION=$(curl -fsSL https://api.github.com/repos/ducaale/xh/releases/latest | \
+  grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+if [ $(uname) = "Linux" ]; then
+  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz -C "$TARGET_HOME/bin" --strip-components=1
+elif [ $(uname) = "Darwin" ]; then
+  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-apple-darwin.tar.gz | tar xz -C "$TARGET_HOME/bin" --strip-components=1
+fi
+
+# install eza
+
+echo "installing eza"
+sudo mkdir -p /etc/apt/keyrings
+wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
+echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | sudo tee /etc/apt/sources.list.d/gierens.list
+sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
+sudo apt update && sudo apt install -y eza
+
+
 #install docker
 
 sudo install -m 0755 -d /etc/apt/keyrings && \
@@ -239,3 +262,9 @@ fi
 sudo -u "$TARGET_USER" tee "$TARGET_HOME/.zshrc" >/dev/null <<'EOF'
 source ~/Documents/chadgrant/dotfiles/zshrc
 EOF
+
+# zsh completions
+git clone https://github.com/zsh-users/zsh-completions.git ~/.zsh/zsh-completions
+curl -sfL https://raw.githubusercontent.com/jqlang/jq/master/jq.zsh -o ~/.zsh/completions/_jq
+git clone https://github.com/zsh-users/zsh-autosuggestions.git ~/.zsh/zsh-autosuggestions
+git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ~/.zsh/zsh-syntax-highlighting

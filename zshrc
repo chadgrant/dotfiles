@@ -81,9 +81,6 @@ function killvpn() {
 }
 
 # Setup completions BEFORE zprezto
-if [[ ! -d ~/.zsh/zsh-completions ]]; then
-    git clone https://github.com/zsh-users/zsh-completions.git ~/.zsh/zsh-completions
-fi
 
 if [[ ! -d ~/.zsh/completions ]]; then
     mkdir -p ~/.zsh/completions
@@ -92,21 +89,7 @@ if [[ ! -d ~/.zsh/completions ]]; then
     command -v npm >/dev/null 2>&1 && npm completion > ~/.zsh/completions/_npm 2>/dev/null
     command -v xh >/dev/null 2>&1 && xh --generate-completion zsh > ~/.zsh/completions/_xh 2>/dev/null
 fi
-
-if [[ ! -f ~/.zsh/completions/_jq ]]; then
-  curl -sfL https://raw.githubusercontent.com/jqlang/jq/master/jq.zsh -o ~/.zsh/completions/_jq
-fi
-
-# Install zsh-autosuggestions for history-based suggestions
-if [[ ! -d ~/.zsh/zsh-autosuggestions ]]; then
-    git clone https://github.com/zsh-users/zsh-autosuggestions.git ~/.zsh/zsh-autosuggestions
-fi
-
-# Install zsh-syntax-highlighting for command validation
-if [[ ! -d ~/.zsh/zsh-syntax-highlighting ]]; then
-    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ~/.zsh/zsh-syntax-highlighting
-fi
-
+ 
 fpath=(~/.zsh/zsh-completions/src ~/.zsh/completions $fpath)
 
 if [[ -s "${ZDOTDIR:-$HOME}/.zprezto/init.zsh" ]]; then
@@ -138,7 +121,6 @@ fi
 # Load syntax highlighting (must be loaded last)
 [[ -f ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]] && source ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 
-
 #USER BIN dir
 if [[ ! -d ~/bin ]]; then
     mkdir ~/bin
@@ -146,10 +128,6 @@ fi
 
 export PATH="$HOME/bin:$PATH"
 
-if ! type "direnv" > /dev/null; then
-  echo "installing direnv"
-  sudo curl -sfL https://direnv.net/install.sh | bash > /dev/null 2>&1
-fi
 eval "$(direnv hook zsh)"
 
 #bat
@@ -189,15 +167,7 @@ else
 fi
 
 if [ "${LINUX}" = true ]; then
-  if ! type "eza" > /dev/null; then
-      echo "installing eza"
-      sudo mkdir -p /etc/apt/keyrings
-      wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
-      echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | sudo tee /etc/apt/sources.list.d/gierens.list
-      sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
-      sudo apt update
-      sudo apt install -y eza
-  else
+  if type "eza" > /dev/null; then
     unalias la ll ls tree 2>/dev/null
     alias ls='eza --git'
     alias la='eza -lah --grid --git'
@@ -219,21 +189,9 @@ if [ -f /usr/local/go/bin/go ]; then
   export GOPROXY=https://goproxy.shrinkled.com,direct
   export PATH=$PATH:/usr/local/go/bin
   export PATH=$PATH:$HOME/go/bin
-fi
 
-unalias gt 2>/dev/null
-alias gt='go test -v ./...'
-
-
-#xh - modern curl alternative
-if ! type "xh" > /dev/null; then
-  echo "installing xh"
-  XH_VERSION=0.25.0
-  if [ $(uname) = "Linux" ]; then
-    curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz -C $HOME/bin --strip-components=1
-  elif [ $(uname) = "Darwin" ]; then
-    curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-apple-darwin.tar.gz | tar xz -C $HOME/bin --strip-components=1
-  fi
+  unalias gt 2>/dev/null
+  alias gt='go test -v ./...'
 fi
 
 
