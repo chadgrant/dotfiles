@@ -237,14 +237,6 @@ if ! type "xh" > /dev/null; then
 fi
 
 
-#NODE
-# NODE_VERSION=18.16.0
-# NODE_DISTRO=x64
-
-# if [ -f /usr/local/lib/nodejs/node-v$NODE_VERSION-linux-$NODE_DISTRO/bin/node ]; then
-#   export PATH=/usr/local/lib/nodejs/node-v$NODE_VERSION-linux-$NODE_DISTRO/bin:$PATH
-# fi
-
 # pnpm global binaries
 export PNPM_HOME="$HOME/.local/share/pnpm"
 export PATH="$PNPM_HOME:$PATH"
@@ -353,16 +345,6 @@ function urlencode() {
 
  
 ### Dotnet
-
-export DOTNET_ROOT=$HOME/.dotnet
-export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
-
-if ! type "dotnet" > /dev/null; then
-  echo "dotnet not installed"
-  curl -L https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
-  bash dotnet-install.sh --channel 10.0
-  rm -f dotnet-install.sh
-fi
 
 # zsh parameter completion for the dotnet CLI
 _dotnet_zsh_complete()

@@ -138,6 +138,45 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 # Verify
 bun --version
 
+#install golang
+
+ARCH="linux-amd64"
+INSTALL_DIR="/usr/local"
+
+LATEST_VERSION=$(curl -fsSL https://go.dev/dl/?mode=json | jq -r '[.[] | select(.stable==true)][0].version')
+
+echo "Latest Go version is: $LATEST_VERSION"
+read -rp "Enter Go version (e.g. go1.22.3). Leave empty for latest: " GO_VERSION
+
+GO_VERSION="${GO_VERSION:-$LATEST_VERSION}"
+
+TARBALL="${GO_VERSION}.${ARCH}.tar.gz"
+URL="https://go.dev/dl/${TARBALL}"
+echo "Installing $GO_VERSION..."
+curl -fLO "$URL"
+sudo rm -rf "${INSTALL_DIR}/go"
+sudo tar -C "$INSTALL_DIR" -xzf "$TARBALL"
+rm -f "$TARBALL"
+mkdir -p "$TARGET_HOME/go/bin"
+
+if ! grep -q "/usr/local/go/bin" /etc/profile; then
+  echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' | sudo tee -a /etc/profile >/dev/null
+fi
+export PATH=$PATH:/usr/local/go/bin
+export PATH=$PATH:$TARGET_HOME/go/bin
+
+go version
+
+#install dotnet
+
+curl -L https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+bash dotnet-install.sh --channel 10.0
+rm -f dotnet-install.sh
+
+echo 'export PATH=$PATH:$HOME/.dotnet:$HOME/.dotnet/tools' | sudo tee -a /etc/profile >/dev/null
+export DOTNET_ROOT=$TARGET_HOME/.dotnet
+export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
+
 #install fzf
 FZF_VERSION=$(curl -fsSL https://api.github.com/repos/junegunn/fzf/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
