@@ -1,17 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+OS="$(uname)"
+MACHINE="$(uname -m)"
+# normalized arch: amd64 / arm64
+case "$MACHINE" in
+  x86_64|amd64) ARCH="amd64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *) ARCH="$MACHINE" ;;
+esac
+
 TARGET_USER="${SUDO_USER:-$(id -un)}"
-TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+if [ "$OS" = "Darwin" ]; then
+  TARGET_HOME="$(dscl . -read /Users/"$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  PROFILE_FILE="/etc/zprofile"
+else
+  TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+  PROFILE_FILE="/etc/profile"
+fi
+: "${TARGET_HOME:=$HOME}"
 
-sudo apt-get update
-sudo apt-get upgrade -y
+as_user() { sudo -u "$TARGET_USER" HOME="$TARGET_HOME" "$@"; }
 
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils tzdata
-sudo ln -sf /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
-sudo dpkg-reconfigure -f noninteractive tzdata
+if [ "$OS" = "Linux" ]; then
+  sudo apt-get update
+  sudo apt-get upgrade -y
 
-sudo apt-get install git curl keychain openssh-server apt-transport-https ca-certificates software-properties-common build-essential unzip jq zsh -y
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils tzdata
+  sudo ln -sf /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+  sudo dpkg-reconfigure -f noninteractive tzdata
+
+  sudo apt-get install git curl keychain openssh-server apt-transport-https ca-certificates software-properties-common build-essential unzip jq zsh -y
+elif [ "$OS" = "Darwin" ]; then
+  printf '\n\nEnsuring Xcode Command Line Tools ...\n\n'
+  if ! xcode-select -p >/dev/null 2>&1; then
+    xcode-select --install || true
+    echo "Complete the Xcode CLT install GUI dialog, then re-run this script."
+    exit 1
+  fi
+
+  printf '\n\nInstalling Homebrew (latest) ...\n\n'
+  if ! command -v brew >/dev/null 2>&1; then
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  else
+    brew update
+  fi
+
+  # Make brew available in this shell
+  if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [ -x /usr/local/bin/brew ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+
+  # Minimal brew use: only for tools without easy direct binaries
+  brew install jq
+
+  # Set timezone (no tzdata/dpkg-reconfigure on macOS)
+  sudo systemsetup -settimezone America/Los_Angeles >/dev/null 2>&1 || true
+else
+  echo "Unsupported OS: $OS" >&2
+  exit 1
+fi
 
 printf '\n\nSetting up SSH ...\n\n'
 
@@ -41,12 +91,18 @@ awk '
   /-----END OPENSSH PRIVATE KEY-----/ { exit }
 ' /tmp/raw_ssh_key > "$TARGET_HOME/.ssh/id_rsa"
 
-chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+if [ "$OS" = "Darwin" ]; then
+  sudo chown -R "$TARGET_USER:staff" "$TARGET_HOME/.ssh"
+else
+  sudo chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+fi
 chmod 600 $TARGET_HOME/.ssh/authorized_keys
 chmod 600 $TARGET_HOME/.ssh/id_*
 chmod 644 $TARGET_HOME/.ssh/*.pub
 
-sudo service ssh restart
+if [ "$OS" = "Linux" ]; then
+  sudo service ssh restart
+fi
 
 if [ -z "${SSH_AUTH_SOCK:-}" ]; then
   eval "$(ssh-agent -s)"
@@ -57,9 +113,16 @@ if ! ssh-add -l >/dev/null 2>&1; then
   ssh-add "$TARGET_HOME/.ssh/id_rsa"
 fi
 
-#configure keychain
+#configure keychain (Linux only; macOS uses Apple keychain via ssh-agent)
 
-echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
+if [ "$OS" = "Linux" ]; then
+  if ! grep -q 'keychain --eval' "$TARGET_HOME/.bash_profile" 2>/dev/null; then
+    echo "eval \`keychain --eval --agents ssh id_rsa\`" >> "$TARGET_HOME/.bash_profile"
+  fi
+elif [ "$OS" = "Darwin" ]; then
+  # Use macOS keychain to store passphrase
+  ssh-add --apple-use-keychain "$TARGET_HOME/.ssh/id_rsa" 2>/dev/null || true
+fi
 
 
 #configure git
@@ -80,53 +143,74 @@ printf '\n\nInstalling xh ...\n\n'
 sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/bin"
 XH_VERSION=$(curl -fsSL https://api.github.com/repos/ducaale/xh/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-if [ $(uname) = "Linux" ]; then
-  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
-elif [ $(uname) = "Darwin" ]; then
-  curl -sfL https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-$(uname -m)-apple-darwin.tar.gz | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
+if [ "$OS" = "Linux" ]; then
+  curl -sfL "https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-${MACHINE}-unknown-linux-musl.tar.gz" | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
+elif [ "$OS" = "Darwin" ]; then
+  curl -sfL "https://github.com/ducaale/xh/releases/download/v${XH_VERSION}/xh-v${XH_VERSION}-${MACHINE}-apple-darwin.tar.gz" | sudo -u "$TARGET_USER" tar xz -C "$TARGET_HOME/bin" --strip-components=1
 fi
 
 # Persist ~/bin on PATH for login shells
-if ! grep -q 'HOME/bin' /etc/profile; then
-  echo 'export PATH="$HOME/bin:$PATH"' | sudo tee -a /etc/profile >/dev/null
+if ! sudo grep -q 'HOME/bin' "$PROFILE_FILE" 2>/dev/null; then
+  echo 'export PATH="$HOME/bin:$PATH"' | sudo tee -a "$PROFILE_FILE" >/dev/null
 fi
 
 # install eza
 
 printf '\n\nInstalling eza ...\n\n'
 
-sudo mkdir -p /etc/apt/keyrings
-wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
-echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | sudo tee /etc/apt/sources.list.d/gierens.list
-sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
-sudo apt update && sudo apt install -y eza
+if [ "$OS" = "Linux" ]; then
+  sudo mkdir -p /etc/apt/keyrings
+  wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | sudo tee /etc/apt/sources.list.d/gierens.list
+  sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
+  sudo apt update && sudo apt install -y eza
+elif [ "$OS" = "Darwin" ]; then
+  EZA_VERSION=$(curl -fsSL https://api.github.com/repos/eza-community/eza/releases/latest | \
+    grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+  case "$ARCH" in
+    arm64) EZA_TRIPLE="aarch64-apple-darwin" ;;
+    amd64) EZA_TRIPLE="x86_64-apple-darwin" ;;
+  esac
+  TMPDIR_EZA="$(mktemp -d)"
+  curl -fsSL -o "$TMPDIR_EZA/eza.zip" "https://github.com/eza-community/eza/releases/download/v${EZA_VERSION}/eza_${EZA_TRIPLE}.zip"
+  (cd "$TMPDIR_EZA" && unzip -q eza.zip)
+  sudo install -m 0755 "$TMPDIR_EZA/eza" /usr/local/bin/eza
+  rm -rf "$TMPDIR_EZA"
+fi
 
 
 #install docker
 
 printf '\n\nInstalling docker ...\n\n'
 
-sudo install -m 0755 -d /etc/apt/keyrings && \
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
-sudo chmod a+r /etc/apt/keyrings/docker.asc && \
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-sudo apt-get update && \
-sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+if [ "$OS" = "Linux" ]; then
+  sudo install -m 0755 -d /etc/apt/keyrings && \
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+  sudo chmod a+r /etc/apt/keyrings/docker.asc && \
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+  sudo apt-get update && \
+  sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 
-
-sudo groupadd -f docker
-sudo usermod -aG docker "$TARGET_USER"
+  sudo groupadd -f docker
+  sudo usermod -aG docker "$TARGET_USER"
+elif [ "$OS" = "Darwin" ]; then
+  if [ ! -d "/Applications/Docker.app" ]; then
+    echo "Docker Desktop not detected. Install manually from https://www.docker.com/products/docker-desktop/ (or 'brew install --cask docker')."
+  fi
+fi
 
 #install dir env
 
 printf '\n\nInstalling direnv ...\n\n'
 
 curl -sfL https://direnv.net/install.sh | sudo bin_path=/usr/local/bin bash
-if ! grep -q 'direnv hook bash' "$TARGET_HOME/.bashrc" 2>/dev/null; then
-  sudo -u "$TARGET_USER" tee -a "$TARGET_HOME/.bashrc" >/dev/null <<'EOF'
+BASH_RC_FILE="$TARGET_HOME/.bashrc"
+[ "$OS" = "Darwin" ] && BASH_RC_FILE="$TARGET_HOME/.bash_profile"
+if ! grep -q 'direnv hook bash' "$BASH_RC_FILE" 2>/dev/null; then
+  sudo -u "$TARGET_USER" tee -a "$BASH_RC_FILE" >/dev/null <<'EOF'
 
 # direnv hook
 eval "$(direnv hook bash)"
@@ -138,7 +222,9 @@ fi
 printf '\n\nInstalling kubectl ...\n\n'
 
 VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -fsSLO "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
+KUBE_OS="linux"
+[ "$OS" = "Darwin" ] && KUBE_OS="darwin"
+curl -fsSLO "https://dl.k8s.io/release/${VERSION}/bin/${KUBE_OS}/${ARCH}/kubectl"
 chmod +x kubectl
 sudo mv kubectl /usr/local/bin/kubectl
 
@@ -181,7 +267,9 @@ EOF
 
 printf '\n\nInstalling golang ...\n\n'
 
-ARCH="linux-amd64"
+GO_OS="linux"
+[ "$OS" = "Darwin" ] && GO_OS="darwin"
+GO_PLATFORM="${GO_OS}-${ARCH}"
 INSTALL_DIR="/usr/local"
 
 LATEST_VERSION=$(curl -fsSL https://go.dev/dl/?mode=json | jq -r '[.[] | select(.stable==true)][0].version')
@@ -191,7 +279,7 @@ read -rp "Enter Go version (e.g. go1.22.3). Leave empty for latest: " GO_VERSION
 
 GO_VERSION="${GO_VERSION:-$LATEST_VERSION}"
 
-TARBALL="${GO_VERSION}.${ARCH}.tar.gz"
+TARBALL="${GO_VERSION}.${GO_PLATFORM}.tar.gz"
 URL="https://go.dev/dl/${TARBALL}"
 echo "Installing $GO_VERSION..."
 curl -fsSLO "$URL"
@@ -200,8 +288,8 @@ sudo tar -C "$INSTALL_DIR" -xzf "$TARBALL"
 rm -f "$TARBALL"
 sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/go/bin"
 
-if ! grep -q "/usr/local/go/bin" /etc/profile; then
-  echo 'export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"' | sudo tee -a /etc/profile >/dev/null
+if ! sudo grep -q "/usr/local/go/bin" "$PROFILE_FILE" 2>/dev/null; then
+  echo 'export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"' | sudo tee -a "$PROFILE_FILE" >/dev/null
 fi
 export PATH="$PATH:/usr/local/go/bin:$TARGET_HOME/go/bin"
 
@@ -218,9 +306,9 @@ bash /tmp/dotnet-install.sh --channel 10.0
 rm -f /tmp/dotnet-install.sh
 EOF
 
-if ! grep -q 'DOTNET_ROOT' /etc/profile; then
-  echo 'export DOTNET_ROOT="$HOME/.dotnet"' | sudo tee -a /etc/profile >/dev/null
-  echo 'export PATH="$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools"' | sudo tee -a /etc/profile >/dev/null
+if ! sudo grep -q 'DOTNET_ROOT' "$PROFILE_FILE" 2>/dev/null; then
+  echo 'export DOTNET_ROOT="$HOME/.dotnet"' | sudo tee -a "$PROFILE_FILE" >/dev/null
+  echo 'export PATH="$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools"' | sudo tee -a "$PROFILE_FILE" >/dev/null
 fi
 export DOTNET_ROOT="$TARGET_HOME/.dotnet"
 export PATH="$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools"
@@ -231,9 +319,11 @@ printf '\n\nInstalling fzf ...\n\n'
 
 FZF_VERSION=$(curl -fsSL https://api.github.com/repos/junegunn/fzf/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+FZF_OS="linux"
+[ "$OS" = "Darwin" ] && FZF_OS="darwin"
 
-curl -fsSLO "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz" && \
-tar -xvf fzf-*.tar.gz && \
+curl -fsSLO "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-${FZF_OS}_${ARCH}.tar.gz" && \
+tar -xf "fzf-${FZF_VERSION}-${FZF_OS}_${ARCH}.tar.gz" && \
 sudo mv fzf /usr/local/bin/fzf && \
 rm -f fzf-*.tar.gz
 
@@ -244,9 +334,23 @@ printf '\n\nInstalling fd ...\n\n'
 FD_VERSION=$(curl -fsSL https://api.github.com/repos/sharkdp/fd/releases/latest | \
   grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
 
-curl -fsSLO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd_${FD_VERSION}_amd64.deb" && \
-sudo dpkg -i fd_*.deb && \
-rm -f fd_*.deb
+if [ "$OS" = "Linux" ]; then
+  FD_DEB_ARCH="amd64"
+  [ "$ARCH" = "arm64" ] && FD_DEB_ARCH="arm64"
+  curl -fsSLO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd_${FD_VERSION}_${FD_DEB_ARCH}.deb" && \
+  sudo dpkg -i fd_*.deb && \
+  rm -f fd_*.deb
+elif [ "$OS" = "Darwin" ]; then
+  case "$ARCH" in
+    arm64) FD_TRIPLE="aarch64-apple-darwin" ;;
+    amd64) FD_TRIPLE="x86_64-apple-darwin" ;;
+  esac
+  FD_TARBALL="fd-v${FD_VERSION}-${FD_TRIPLE}.tar.gz"
+  curl -fsSLO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/${FD_TARBALL}"
+  tar -xzf "$FD_TARBALL"
+  sudo install -m 0755 "fd-v${FD_VERSION}-${FD_TRIPLE}/fd" /usr/local/bin/fd
+  rm -rf "$FD_TARBALL" "fd-v${FD_VERSION}-${FD_TRIPLE}"
+fi
 
 #setup zsh
 

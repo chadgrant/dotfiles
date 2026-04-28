@@ -3,8 +3,19 @@ setopt HIST_IGNORE_SPACE
 USERNAME=$USER
 
 LINUX=false
-if [ $(uname) = "Linux" ]; then
-  LINUX=true
+MACOS=false
+case "$(uname)" in
+  Linux)  LINUX=true ;;
+  Darwin) MACOS=true ;;
+esac
+
+# Homebrew shellenv (macOS, when present)
+if [ "${MACOS}" = true ]; then
+  if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [ -x /usr/local/bin/brew ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
 fi
 
 ITERM=false
@@ -27,7 +38,7 @@ fi
 
 USEPOWER9k=false
 
-if [[ "${ITERM}" = true || "${LINUX}" = true ]]; then
+if [[ "${ITERM}" = true || "${LINUX}" = true || "${MACOS}" = true ]]; then
   USEPOWER9k=true
 
   if [ "${WSL}" = true ]; then
@@ -143,11 +154,14 @@ export DOTNET_ROOT="$HOME/.dotnet"
 
 eval "$(direnv hook zsh)"
 
-#bat
-if type "batcat" > /dev/null; then
+#bat (Linux ships as `batcat`, macOS as `bat`)
+if type "batcat" > /dev/null 2>&1; then
   alias cat='batcat'
   alias bat='batcat'
-  alias catcat='/usr/bin/cat'
+  alias catcat='/bin/cat'
+elif type "bat" > /dev/null 2>&1; then
+  alias cat='bat'
+  alias catcat='/bin/cat'
 fi
 
 #fzf
@@ -179,14 +193,12 @@ else
   }
 fi
 
-if [ "${LINUX}" = true ]; then
-  if type "eza" > /dev/null; then
-    unalias la ll ls tree 2>/dev/null
-    alias ls='eza --git'
-    alias la='eza -lah --grid --git'
-    alias ll='eza -lah --grid --git'
-    alias tree='eza -T --git'
-  fi
+if type "eza" > /dev/null 2>&1; then
+  unalias la ll ls tree 2>/dev/null
+  alias ls='eza --git'
+  alias la='eza -lah --grid --git'
+  alias ll='eza -lah --grid --git'
+  alias tree='eza -T --git'
 fi
 
 if type "keychain" > /dev/null; then
@@ -377,7 +389,11 @@ gitdeleteremotetag() {
 unalias ping mkdir ports wget headers envgrep untar mkcd ff 2>/dev/null
 alias ping='ping -c 5'
 alias mkdir='mkdir -pv'
-alias ports='netstat -tulanp'
+if [ "${MACOS}" = true ]; then
+  alias ports='lsof -iTCP -sTCP:LISTEN -P -n'
+else
+  alias ports='netstat -tulanp'
+fi
 alias wget='wget -c'
 alias headers='curl -I'
 alias envgrep='env | grep'
