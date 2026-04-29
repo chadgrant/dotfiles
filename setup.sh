@@ -73,28 +73,33 @@ curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/maste
 echo "$EXPECTED_HASH  /tmp/ak" | sha256sum -c || exit 1
 mv /tmp/ak "$TARGET_HOME/.ssh/authorized_keys"
 
-EXPECTED_HASH="b1ba3f7c085369a270d415a33047515763528e42687241a5027c752af7435d33"
-curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/id_rsa.pub -o /tmp/pubkey
-echo "$EXPECTED_HASH  /tmp/pubkey" | sha256sum -c || exit 1
-mv /tmp/pubkey "$TARGET_HOME/.ssh/id_rsa.pub"
+if [ -f "$TARGET_HOME/.ssh/id_rsa" ] && [ -f "$TARGET_HOME/.ssh/id_rsa.pub" ]; then
+  echo "SSH key already present at $TARGET_HOME/.ssh/id_rsa, skipping key import."
+else
+  EXPECTED_HASH="b1ba3f7c085369a270d415a33047515763528e42687241a5027c752af7435d33"
+  curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/id_rsa.pub -o /tmp/pubkey
+  echo "$EXPECTED_HASH  /tmp/pubkey" | sha256sum -c || exit 1
+  mv /tmp/pubkey "$TARGET_HOME/.ssh/id_rsa.pub"
 
-echo "Paste your private key. End with a blank line."
+  echo "Paste your private key. End with a blank line."
 
-awk '
-  NF == 0 { exit }
-  { print }
-' | sed 's/\r$//' > /tmp/raw_ssh_key
+  awk '
+    NF == 0 { exit }
+    { print }
+  ' | sed 's/\r$//' > /tmp/raw_ssh_key
 
-awk '
-  /-----BEGIN OPENSSH PRIVATE KEY-----/ { inkey=1 }
-  inkey { print }
-  /-----END OPENSSH PRIVATE KEY-----/ { exit }
-' /tmp/raw_ssh_key > "$TARGET_HOME/.ssh/id_rsa"
+  awk '
+    /-----BEGIN OPENSSH PRIVATE KEY-----/ { inkey=1 }
+    inkey { print }
+    /-----END OPENSSH PRIVATE KEY-----/ { exit }
+  ' /tmp/raw_ssh_key > "$TARGET_HOME/.ssh/id_rsa"
+fi
 
 if [ "$OS" = "Darwin" ]; then
   sudo chown -R "$TARGET_USER:staff" "$TARGET_HOME/.ssh"
 else
-  sudo chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+  TARGET_GROUP="$(id -gn "$TARGET_USER")"
+  sudo chown -R "$TARGET_USER:$TARGET_GROUP" "$TARGET_HOME/.ssh"
 fi
 chmod 600 $TARGET_HOME/.ssh/authorized_keys
 chmod 600 $TARGET_HOME/.ssh/id_*
@@ -263,6 +268,90 @@ npm -v
 bun --version
 EOF
 
+#install claude code
+
+printf '\n\nInstalling Claude Code ...\n\n'
+
+sudo -u "$TARGET_USER" HOME="$TARGET_HOME" bash <<'EOF'
+set -e
+export NVM_DIR="$HOME/.nvm"
+# shellcheck disable=SC1090
+. "$NVM_DIR/nvm.sh"
+npm install -g @anthropic-ai/claude-code
+claude --version || true
+EOF
+
+#install Ubuntu Nerd Font
+
+printf '\n\nInstalling Nerd Fonts (Ubuntu + Meslo for Powerlevel10k) ...\n\n'
+
+NF_VERSION=$(curl -fsSL https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest | \
+  grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+
+# Powerlevel10k recommends MesloLGS NF (Regular/Bold/Italic/Bold Italic)
+P10K_FONT_BASE="https://github.com/romkatv/powerlevel10k-media/raw/master"
+P10K_FONTS=(
+  "MesloLGS%20NF%20Regular.ttf"
+  "MesloLGS%20NF%20Bold.ttf"
+  "MesloLGS%20NF%20Italic.ttf"
+  "MesloLGS%20NF%20Bold%20Italic.ttf"
+)
+
+install_fonts_linux() {
+  local font_dir="/usr/share/fonts/truetype/nerd-fonts"
+  sudo mkdir -p "$font_dir"
+  local tmp; tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/UbuntuMono.zip" \
+    "https://github.com/ryanoasis/nerd-fonts/releases/download/v${NF_VERSION}/UbuntuMono.zip"
+  curl -fsSL -o "$tmp/Meslo.zip" \
+    "https://github.com/ryanoasis/nerd-fonts/releases/download/v${NF_VERSION}/Meslo.zip"
+  (cd "$tmp" && unzip -q -o UbuntuMono.zip -d ubuntu && unzip -q -o Meslo.zip -d meslo)
+  sudo cp "$tmp"/ubuntu/*.ttf "$font_dir"/ 2>/dev/null || true
+  sudo cp "$tmp"/ubuntu/*.otf "$font_dir"/ 2>/dev/null || true
+  sudo cp "$tmp"/meslo/*.ttf "$font_dir"/ 2>/dev/null || true
+  # Powerlevel10k recommended MesloLGS NF
+  for f in "${P10K_FONTS[@]}"; do
+    sudo curl -fsSL -o "$font_dir/$(printf '%b' "${f//%/\\x}")" "$P10K_FONT_BASE/$f"
+  done
+  rm -rf "$tmp"
+  command -v fc-cache >/dev/null 2>&1 && sudo fc-cache -f >/dev/null || true
+}
+
+install_fonts_mac() {
+  sudo -u "$TARGET_USER" HOME="$TARGET_HOME" NF_VERSION="$NF_VERSION" bash <<'EOF'
+set -e
+FONT_DIR="$HOME/Library/Fonts"
+mkdir -p "$FONT_DIR"
+TMP="$(mktemp -d)"
+curl -fsSL -o "$TMP/UbuntuMono.zip" \
+  "https://github.com/ryanoasis/nerd-fonts/releases/download/v${NF_VERSION}/UbuntuMono.zip"
+curl -fsSL -o "$TMP/Meslo.zip" \
+  "https://github.com/ryanoasis/nerd-fonts/releases/download/v${NF_VERSION}/Meslo.zip"
+(cd "$TMP" && unzip -q -o UbuntuMono.zip -d ubuntu && unzip -q -o Meslo.zip -d meslo)
+cp "$TMP"/ubuntu/*.ttf "$FONT_DIR"/ 2>/dev/null || true
+cp "$TMP"/ubuntu/*.otf "$FONT_DIR"/ 2>/dev/null || true
+cp "$TMP"/meslo/*.ttf  "$FONT_DIR"/ 2>/dev/null || true
+
+# Powerlevel10k recommended MesloLGS NF
+for f in \
+  "MesloLGS%20NF%20Regular.ttf" \
+  "MesloLGS%20NF%20Bold.ttf" \
+  "MesloLGS%20NF%20Italic.ttf" \
+  "MesloLGS%20NF%20Bold%20Italic.ttf"; do
+  out="$(printf '%b' "${f//%/\\x}")"
+  curl -fsSL -o "$FONT_DIR/$out" "https://github.com/romkatv/powerlevel10k-media/raw/master/$f"
+done
+
+rm -rf "$TMP"
+EOF
+}
+
+if [ "$OS" = "Linux" ]; then
+  install_fonts_linux
+elif [ "$OS" = "Darwin" ]; then
+  install_fonts_mac
+fi
+
 #install golang
 
 printf '\n\nInstalling golang ...\n\n'
@@ -378,7 +467,12 @@ sudo -u "$TARGET_USER" ZDOTDIR="$ZDOTDIR" zsh -c '
 # Set login shell
 ZSH_PATH="$(command -v zsh)"
 grep -qxF "$ZSH_PATH" /etc/shells || echo "$ZSH_PATH" | sudo tee -a /etc/shells >/dev/null
-sudo chsh -s "$ZSH_PATH" "$TARGET_USER"
+if getent passwd "$TARGET_USER" >/dev/null 2>&1 && grep -q "^$TARGET_USER:" /etc/passwd 2>/dev/null; then
+  sudo chsh -s "$ZSH_PATH" "$TARGET_USER"
+else
+  echo "Skipping chsh: '$TARGET_USER' is not a local /etc/passwd user (likely LDAP/SSSD/AD)."
+  echo "Set your login shell via your directory service, or run: sudo usermod -s $ZSH_PATH $TARGET_USER"
+fi
 
 # Dotfiles
 sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/Documents/chadgrant"
