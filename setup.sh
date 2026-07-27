@@ -10,6 +10,21 @@ case "$MACHINE" in
   *) ARCH="$MACHINE" ;;
 esac
 
+# Self-hosted Infisical instance that supplies this machine's secrets and keys.
+# Project "secret-management"; override any of these to bootstrap from elsewhere.
+INFISICAL_DOMAIN="${INFISICAL_DOMAIN:-https://infisical.deviantgeek.io}"
+INFISICAL_PROJECT_ID="${INFISICAL_PROJECT_ID:-3abbe79b-4cd2-4e68-9e76-4e59d8865f92}"
+INFISICAL_ENV="${INFISICAL_ENV:-prod}"
+
+# Key material sits at the root path alongside everything else. Folder scoping
+# was tried and abandoned: `secrets folders create` does not honour --env, so
+# the folder was created in dev while prod kept 404ing. What keeps the private
+# key out of the shell environment is the name exclusion in
+# zsh/47-infisical.zsh, not its location in the project.
+INFISICAL_SSH_PATH="/"
+SSH_PRIVATE_KEY_SECRET="SSH_PRIVATE_KEY"
+SSH_PUBLIC_KEY_SECRET="SSH_PUBLIC_KEY"
+
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 if [ "$OS" = "Darwin" ]; then
   TARGET_HOME="$(dscl . -read /Users/"$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
@@ -63,6 +78,71 @@ else
   exit 1
 fi
 
+#install infisical
+#
+# Must precede SSH setup: the private key, and every later `git clone` over
+# ssh, come out of Infisical.
+
+printf '\n\nInstalling Infisical CLI ...\n\n'
+
+if [ "$OS" = "Linux" ]; then
+  curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+  sudo apt-get update && sudo apt-get install -y infisical
+elif [ "$OS" = "Darwin" ]; then
+  brew install infisical/get-cli/infisical
+fi
+
+# On macOS the login token belongs in the Keychain. Linux and WSL have no
+# keyring daemon, so they keep the encrypted file backend.
+if [ "$OS" = "Darwin" ]; then
+  as_user infisical vault set auto
+else
+  as_user infisical vault set file
+fi
+
+printf '\n\nLogging into Infisical (%s) ...\n' "$INFISICAL_DOMAIN"
+printf 'This is the only interactive login; the CLI refreshes itself afterwards.\n\n'
+
+if ! as_user infisical login --domain="$INFISICAL_DOMAIN"; then
+  echo "Infisical login did not complete. Run this, then re-run setup.sh:" >&2
+  echo "  infisical login --domain=$INFISICAL_DOMAIN" >&2
+  exit 1
+fi
+
+# Writes one key from $INFISICAL_SSH_PATH to a file, creating nothing on
+# failure. The file is given its final mode before any key material reaches it.
+fetch_ssh_secret_to_file() {
+  local secret_name="$1"
+  local destination="$2"
+  local mode="$3"
+  local staged="${destination}.staged.$$"
+
+  install -m "$mode" /dev/null "$staged" || return 1
+
+  # `infisical secrets get --path` 404s against this server while `export`
+  # reads the same folder correctly, so the value is pulled out of the JSON
+  # export. jq -e fails when the key is absent; -s on the file catches an
+  # empty read, since a missing secret must not look like success.
+  if ! as_user infisical export --silent --format=json \
+        --domain="$INFISICAL_DOMAIN" \
+        --projectId="$INFISICAL_PROJECT_ID" \
+        --path="$INFISICAL_SSH_PATH" \
+        --env="$INFISICAL_ENV" 2>/dev/null \
+      | jq -er --arg key "$secret_name" \
+          '.[] | select(.key == $key) | .value' > "$staged" \
+      || [ ! -s "$staged" ]; then
+    rm -f "$staged"
+    return 1
+  fi
+
+  # ssh-keygen rejects a key whose last line is unterminated. Anything already
+  # terminated is left byte-for-byte alone — trailing newlines are part of the
+  # original file and stripping them would not reproduce it.
+  [ -s "$staged" ] && [ -n "$(tail -c 1 "$staged")" ] && printf '\n' >> "$staged"
+
+  mv -f "$staged" "$destination"
+}
+
 printf '\n\nSetting up SSH ...\n\n'
 
 mkdir -p "$TARGET_HOME/.ssh"
@@ -76,23 +156,30 @@ mv /tmp/ak "$TARGET_HOME/.ssh/authorized_keys"
 if [ -f "$TARGET_HOME/.ssh/id_rsa" ] && [ -f "$TARGET_HOME/.ssh/id_rsa.pub" ]; then
   echo "SSH key already present at $TARGET_HOME/.ssh/id_rsa, skipping key import."
 else
-  EXPECTED_HASH="b1ba3f7c085369a270d415a33047515763528e42687241a5027c752af7435d33"
-  curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/master/id_rsa.pub -o /tmp/pubkey
-  echo "$EXPECTED_HASH  /tmp/pubkey" | sha256sum -c || exit 1
-  mv /tmp/pubkey "$TARGET_HOME/.ssh/id_rsa.pub"
+  printf 'Pulling SSH keypair from Infisical ...\n'
 
-  echo "Paste your private key. End with a blank line."
+  if ! fetch_ssh_secret_to_file "$SSH_PRIVATE_KEY_SECRET" "$TARGET_HOME/.ssh/id_rsa" 600; then
+    echo "Could not read $SSH_PRIVATE_KEY_SECRET from Infisical ($INFISICAL_ENV)." >&2
+    echo "Upload it first:  infisical secrets set $SSH_PRIVATE_KEY_SECRET=@$TARGET_HOME/.ssh/id_rsa --path=$INFISICAL_SSH_PATH --projectId=$INFISICAL_PROJECT_ID --env=$INFISICAL_ENV" >&2
+    exit 1
+  fi
 
-  awk '
-    NF == 0 { exit }
-    { print }
-  ' | sed 's/\r$//' > /tmp/raw_ssh_key
+  if ! fetch_ssh_secret_to_file "$SSH_PUBLIC_KEY_SECRET" "$TARGET_HOME/.ssh/id_rsa.pub" 644; then
+    echo "Could not read $SSH_PUBLIC_KEY_SECRET from Infisical ($INFISICAL_ENV)." >&2
+    echo "Upload it first:  infisical secrets set $SSH_PUBLIC_KEY_SECRET=@$TARGET_HOME/.ssh/id_rsa.pub --path=$INFISICAL_SSH_PATH --projectId=$INFISICAL_PROJECT_ID --env=$INFISICAL_ENV" >&2
+    exit 1
+  fi
 
-  awk '
-    /-----BEGIN OPENSSH PRIVATE KEY-----/ { inkey=1 }
-    inkey { print }
-    /-----END OPENSSH PRIVATE KEY-----/ { exit }
-  ' /tmp/raw_ssh_key > "$TARGET_HOME/.ssh/id_rsa"
+  if ! grep -q -- "-----BEGIN .*PRIVATE KEY-----" "$TARGET_HOME/.ssh/id_rsa"; then
+    echo "$SSH_PRIVATE_KEY_SECRET does not contain a private key." >&2
+    exit 1
+  fi
+
+  # -P "" verifies an unencrypted key without ever blocking on a prompt. A
+  # passphrase-protected key fails this and that is fine — keychain asks later.
+  if ! ssh-keygen -y -P "" -f "$TARGET_HOME/.ssh/id_rsa" >/dev/null 2>&1; then
+    echo "Private key is passphrase-protected; keychain will prompt on first use."
+  fi
 fi
 
 if [ "$OS" = "Darwin" ]; then
@@ -222,7 +309,7 @@ eval "$(direnv hook bash)"
 EOF
 fi
 
-#install kubectl 
+#install kubectl
 
 printf '\n\nInstalling kubectl ...\n\n'
 

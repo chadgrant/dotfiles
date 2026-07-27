@@ -1,0 +1,16 @@
+# Copy to ~/.extra (chmod 600). Sourced last by zshrc.
+# Keep host-specific bits out of the repo.
+#
+# Secrets do NOT belong here anymore — they live in Infisical and are loaded by
+# zsh/47-infisical.zsh. Put a secret here only to override Infisical on one box.
+
+# Git identity (applied if no .gitconfig.lock present)
+if [ ! -f ~/.gitconfig.lock ]; then
+  git config --global user.name  "Chad Grant"
+  git config --global user.email "you@example.com"
+fi
+
+# Which Infisical project this machine pulls from. Not a secret; set it here if
+# this box should track a different project or environment than the default.
+# export INFISICAL_PROJECT_ID="..."
+# export INFISICAL_ENV="prod"
