@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stand-in for the Infisical CLI so the shell integration can be tested with no
+# credentials, no network, and a fixed set of secrets.
+#
+#   STUB_INFISICAL_FAIL=1   make `export` fail, as an unreachable server would
+#   STUB_INFISICAL_CALLS    file to append one line per call, for asserting
+#                           that a fresh cache does not re-fetch
+
+[ -n "${STUB_INFISICAL_CALLS:-}" ] && echo "$*" >> "$STUB_INFISICAL_CALLS"
+
+case "$1" in
+  export)
+    if [ "${STUB_INFISICAL_FAIL:-0}" = "1" ]; then
+      echo "stub: simulated unreachable server" >&2
+      exit 1
+    fi
+    cat /opt/test/secrets.json
+    ;;
+  *)
+    echo "stub: unsupported command: $*" >&2
+    exit 1
+    ;;
+esac

@@ -12,7 +12,11 @@
 # and INFISICAL_API_URL, so `secrets-status` reports the recorded one.
 
 : ${INFISICAL_DOMAIN:=https://infisical.deviantgeek.io}
-: ${INFISICAL_PROJECT_ID:=3abbe79b-4cd2-4e68-9e76-4e59d8865f92}
+
+# Assigned only when unset, so exporting an empty INFISICAL_PROJECT_ID before
+# the shell starts turns Infisical off for that machine. Using := here would
+# substitute the default over the empty value and re-enable it.
+: ${INFISICAL_PROJECT_ID=3abbe79b-4cd2-4e68-9e76-4e59d8865f92}
 : ${INFISICAL_ENV:=prod}
 : ${INFISICAL_CACHE:=$HOME/.cache/infisical/env}
 : ${INFISICAL_CACHE_MAX_AGE_HOURS:=12}
