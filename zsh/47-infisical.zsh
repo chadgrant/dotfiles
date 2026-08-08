@@ -1,5 +1,10 @@
 # Secrets come from Infisical, never from this repo.
-# The export is cached on disk so opening a shell costs no network round-trip.
+#
+# Every shell fetches, so a secret changed in the project is live in the next
+# shell you open. The on-disk cache is not there to save round trips: it is the
+# fallback for when the server cannot be reached, so a laptop off the network
+# still has its secrets. Set INFISICAL_CACHE_MAX_AGE_HOURS to trade that
+# freshness back for startup time.
 #
 #   secrets-refresh    re-fetch now and reload into this shell
 #   secrets-status     which environment, how old, and whether the session is live
@@ -32,7 +37,16 @@
 # substitute the default over the empty value and re-enable it.
 : ${INFISICAL_PROJECT_ID=3abbe79b-4cd2-4e68-9e76-4e59d8865f92}
 : ${INFISICAL_CACHE:=$HOME/.cache/infisical/env}
-: ${INFISICAL_CACHE_MAX_AGE_HOURS:=12}
+
+# 0 means every shell fetches, and the cache is only a fallback for when the
+# server cannot be reached — which is the whole reason it still exists, since
+# a shell that cannot reach Infisical would otherwise have no secrets at all.
+# Set this to a number of hours to trade freshness for shell startup time.
+: ${INFISICAL_CACHE_MAX_AGE_HOURS:=0}
+
+# Nothing here may hang a login shell. `timeout` is not on every macOS box, so
+# it is used when present and simply skipped when not.
+: ${INFISICAL_TIMEOUT_SECONDS:=10}
 
 # The project keeps one environment per machine, named for that machine. The
 # short hostname is lowercased because Infisical slugs environments that way,
@@ -78,6 +92,17 @@ _infisical_is_configured() {
     && [[ -n "$INFISICAL_PROJECT_ID" ]]
 }
 
+# Every call goes through here, because every call is now on the critical path
+# of opening a shell. A server that accepts the connection and then stalls
+# would otherwise hang the terminal for as long as it felt like.
+_infisical_run() {
+  if (( INFISICAL_TIMEOUT_SECONDS > 0 )) && command -v timeout >/dev/null 2>&1; then
+    timeout "$INFISICAL_TIMEOUT_SECONDS" infisical "$@"
+  else
+    infisical "$@"
+  fi
+}
+
 # The CLI ignores --domain for user logins and always talks to whatever
 # `infisical login` recorded, so hints and status must report that one.
 _infisical_recorded_domain() {
@@ -97,7 +122,7 @@ _infisical_login_hint() {
 # question read-only: it never prompts, and exits non-zero when the session is
 # missing or expired.
 _infisical_has_session() {
-  infisical login status --silent >/dev/null 2>&1 </dev/null
+  _infisical_run login status --silent >/dev/null 2>&1 </dev/null
 }
 
 # The environments to try, best first. An explicit INFISICAL_ENV pins the
@@ -131,6 +156,10 @@ _infisical_cache_env() {
 }
 
 _infisical_cache_is_fresh() {
+  # Checked before the file, so a max age of 0 means "never reuse" even on a
+  # shell where zsh/stat is missing and the age cannot be measured.
+  (( INFISICAL_CACHE_MAX_AGE_HOURS > 0 )) || return 1
+
   [[ -r "$INFISICAL_CACHE" ]] || return 1
 
   # Without zsh/stat the age is unknowable; assume fresh rather than refetch
@@ -148,17 +177,14 @@ _infisical_cache_is_fresh() {
 _infisical_fetch_env() {
   local env=$1
   local staged="${INFISICAL_CACHE}.staged.$$"
+  local raw="${INFISICAL_CACHE}.raw.$$"
 
   mkdir -p -m 700 "${INFISICAL_CACHE:h}" || return 1
 
   # >| rather than >: under noclobber a leftover staged file from a crashed
   # shell with this same pid would make the fetch fail for good.
   : >| "$staged" && chmod 600 "$staged" || return 1
-
-  # JSON rather than dotenv so values can be re-quoted safely with @sh, and so
-  # excluded names are dropped structurally instead of by line-matching a
-  # format where one secret can span many lines.
-  setopt localoptions pipefail
+  : >| "$raw" && chmod 600 "$raw" || return 1
 
   # `always` so an interrupt mid-fetch cannot strand a staged file; the mv on
   # the success path leaves nothing for it to remove. stdin is closed because a
@@ -166,22 +192,29 @@ _infisical_fetch_env() {
   {
     print -r -- "# env=$env" >> "$staged" || return 1
 
-    if ! infisical export --silent --format=json \
-          --domain="$INFISICAL_DOMAIN" \
-          --projectId="$INFISICAL_PROJECT_ID" \
-          --path=/ \
-          --env="$env" \
-          </dev/null \
-        | jq -r --arg exclude "$INFISICAL_ENV_EXCLUDE" \
-            '.[] | select(.key | test($exclude) | not)
-                 | "export \(.key)=\(.value|@sh)"' \
-          >> "$staged"; then
-      return 1
-    fi
+    # Captured to a file rather than piped straight into jq. With no valid
+    # session the CLI writes an interactive login picker to *stdout*, and
+    # feeding that to jq is what put "parse error: Invalid numeric literal" in
+    # front of every shell. Here it lands in a file nobody reads, jq's own
+    # complaint is silenced, and the exit status does the talking.
+    _infisical_run export --silent --format=json \
+        --domain="$INFISICAL_DOMAIN" \
+        --projectId="$INFISICAL_PROJECT_ID" \
+        --path=/ \
+        --env="$env" \
+        </dev/null >| "$raw" 2>/dev/null || return 1
+
+    # JSON rather than dotenv so values can be re-quoted safely with @sh, and
+    # so excluded names are dropped structurally instead of by line-matching a
+    # format where one secret can span many lines.
+    jq -r --arg exclude "$INFISICAL_ENV_EXCLUDE" \
+        '.[] | select(.key | test($exclude) | not)
+             | "export \(.key)=\(.value|@sh)"' \
+        < "$raw" >> "$staged" 2>/dev/null || return 1
 
     mv -f "$staged" "$INFISICAL_CACHE"
   } always {
-    rm -f "$staged"
+    rm -f "$staged" "$raw"
   }
 }
 
@@ -190,13 +223,16 @@ _infisical_fetch_env() {
 # Returns 2 — distinct from any other failure — when the session is expired, so
 # callers can say "log in again" rather than "the server is unreachable".
 _infisical_write_cache() {
-  _infisical_has_session || return 2
-
   local env
   for env in ${(f)"$(_infisical_env_candidates)"}; do
     _infisical_fetch_env "$env" && return 0
   done
 
+  # Asked only once the fetch has already failed. Checking up front cost every
+  # shell a round trip to learn something that only matters when something has
+  # gone wrong, and the export cannot be derailed by a login prompt anyway now
+  # that its stdin is closed.
+  _infisical_has_session || return 2
   return 1
 }
 
@@ -213,6 +249,28 @@ _infisical_load_cache() {
 # "../../.bashrc" or "a/b" writing outside $INFISICAL_SSH_DIR.
 _infisical_ssh_name_ok() {
   [[ $1 == [A-Za-z0-9_]* && $1 != *[^A-Za-z0-9._-]* ]]
+}
+
+# Names of the files the last sync wrote. No secret material, just names, so
+# that a deleted key can be noticed without asking the server.
+_infisical_ssh_manifest=${INFISICAL_CACHE:h}/ssh-manifest
+
+# True when a file the last sync wrote is no longer on disk.
+#
+# Deleting ~/.ssh/id_rsa does not make the secrets cache stale, so without this
+# the file would stay missing until the cache aged out — up to twelve hours of
+# a machine having no key and no explanation. This is a stat of a few names, so
+# it costs nothing on the shells where everything is present.
+_infisical_ssh_files_missing() {
+  [[ -r $_infisical_ssh_manifest ]] || return 1
+
+  local name
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    [[ -e "$INFISICAL_SSH_DIR/$name" ]] || return 0
+  done < $_infisical_ssh_manifest
+
+  return 1
 }
 
 # Writes one file at its final mode before any key material reaches it, then
@@ -259,7 +317,7 @@ _infisical_ssh_sync() {
     : >| "$json" && chmod 600 "$json" || return 1
 
     setopt localoptions pipefail
-    infisical export --silent --format=json \
+    _infisical_run export --silent --format=json \
         --domain="$INFISICAL_DOMAIN" \
         --projectId="$INFISICAL_PROJECT_ID" \
         --path="$INFISICAL_SSH_PATH" \
@@ -276,7 +334,7 @@ _infisical_ssh_sync() {
     chmod 700 "$INFISICAL_SSH_DIR" || return 1
 
     local name mode
-    local -a wrote
+    local -a wrote written_names
     local -i failed=0
     for name in $names; do
       if ! _infisical_ssh_name_ok "$name"; then
@@ -292,11 +350,18 @@ _infisical_ssh_sync() {
 
       if _infisical_ssh_write "$name" "$json" "$mode"; then
         wrote+=( "$name ($mode)" )
+        written_names+=( "$name" )
       else
         print -u2 "ssh: failed to write $name"
         (( failed++ ))
       fi
     done
+
+    # Rewritten every sync, so a key dropped from the project stops being
+    # looked for instead of triggering a resync on every shell forever.
+    if (( ${#written_names} )); then
+      print -rl -- $written_names >| "$_infisical_ssh_manifest"
+    fi
 
     (( ${#wrote} )) && print "ssh: ${(j:, :)wrote} -> $INFISICAL_SSH_DIR (from $env:$INFISICAL_SSH_PATH)"
     (( failed == 0 ))
@@ -355,8 +420,14 @@ secrets-status() {
     return 1
   fi
 
-  local freshness=stale
-  _infisical_cache_is_fresh && freshness=fresh
+  # With no max age the cache is a fallback, not a cache, so reporting it as
+  # perpetually "stale" would read as a fault when it is the normal state.
+  local freshness
+  if (( INFISICAL_CACHE_MAX_AGE_HOURS > 0 )); then
+    _infisical_cache_is_fresh && freshness="cache fresh" || freshness="cache stale"
+  else
+    freshness="fetched every shell"
+  fi
 
   local session=expired
   _infisical_has_session && session=valid
@@ -373,7 +444,7 @@ secrets-status() {
     *)                        origin="pinned via INFISICAL_ENV" ;;
   esac
 
-  print "secrets: $count entries, cache $freshness, session $session, from $(_infisical_recorded_domain)"
+  print "secrets: $count entries, $freshness, session $session, from $(_infisical_recorded_domain)"
   print "  environment: $env ($origin)"
   [[ $session == valid ]] || print "  run: $(_infisical_login_hint)"
 }
@@ -395,6 +466,11 @@ _infisical_load_at_startup() {
     # first shell without every shell paying for it. The environment is taken
     # from the cache just written, so files and variables always agree.
     (( rc == 0 )) && _infisical_ssh_sync "$(_infisical_cache_env)"
+  elif _infisical_ssh_files_missing; then
+    # A deleted key is the one case worth a network call on an otherwise fresh
+    # cache: the shell is the only thing that puts it back, and waiting for the
+    # cache to age out would leave the machine without a key until it did.
+    _infisical_ssh_sync "$(_infisical_cache_env)"
   fi
 
   # An expired session is only worth a word once the cached values have loaded;

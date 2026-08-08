@@ -97,11 +97,11 @@ check "secrets-forget deletes cache" "$([[ -f /tmp/c-cycle/env ]] && print yes |
 out=$(in_shell /tmp/c-cycle/env 'secrets-forget; secrets-refresh >/dev/null; print "$GITHUB_TOKEN"')
 check "secrets-refresh refetches and reloads" "$out" "stub-github-token-not-a-real-pat"
 
-print "== a fresh cache is not refetched =="
+print "== every shell fetches by default =="
 
-# Counts root-path export calls specifically. The session check is a separate
-# call, and the ssh folder is fetched with its own export, so neither is what
-# "refetch" means here.
+# Counts root-path export calls specifically. The ssh folder is fetched with
+# its own export, and the session check is a separate call, so neither is what
+# "fetch" means here.
 exports() { grep -c -- '--path=/ --env=' /tmp/c-calls/log; }
 
 rm -rf /tmp/c-calls; mkdir -p /tmp/c-calls
@@ -109,18 +109,32 @@ in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/nul
 first=$(exports)
 in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
 second=$(exports)
-check "second shell makes no new call" "$second" "$first"
+check "a second shell fetches again" "$(( second - first ))" "1"
 
-# A fresh cache must not even ask whether the session is valid — that is a
-# process spawn on the critical path of every interactive shell.
-check "fresh cache checks no session" \
-  "$(grep -c 'login status' /tmp/c-calls/log)" "1"
+# The session check exists to explain a failure, so on the path where nothing
+# failed it must never run: it would be a round trip per shell for nothing.
+check "a successful fetch never checks the session" \
+  "$(grep -c 'login status' /tmp/c-calls/log)" "0"
 
-# Backdating past the 12h window must trigger exactly one more fetch.
-touch -d '20 hours ago' /tmp/c-calls/env
-in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
-third=$(exports)
-check "stale cache triggers a refetch" "$(( third - second ))" "1"
+out=$(in_shell /tmp/c-calls/env 'print "$WHICH_ENV"' STUB_INFISICAL_CALLS=/tmp/c-calls/log)
+check "and the values are the fetched ones" "$out" "$(hostname -s | tr '[:upper:]' '[:lower:]')"
+
+print "== a max age trades freshness for startup time =="
+
+TTL=(INFISICAL_CACHE_MAX_AGE_HOURS=12)
+rm -rf /tmp/c-ttl; mkdir -p /tmp/c-ttl
+exports_ttl() { grep -c -- '--path=/ --env=' /tmp/c-ttl/log; }
+
+in_shell /tmp/c-ttl/env 'true' $TTL STUB_INFISICAL_CALLS=/tmp/c-ttl/log >/dev/null
+first=$(exports_ttl)
+in_shell /tmp/c-ttl/env 'true' $TTL STUB_INFISICAL_CALLS=/tmp/c-ttl/log >/dev/null
+second=$(exports_ttl)
+check "a fresh cache is not refetched" "$(( second - first ))" "0"
+
+touch -d '20 hours ago' /tmp/c-ttl/env
+in_shell /tmp/c-ttl/env 'true' $TTL STUB_INFISICAL_CALLS=/tmp/c-ttl/log >/dev/null
+third=$(exports_ttl)
+check "and a stale one is" "$(( third - second ))" "1"
 
 print "== server unreachable =="
 
@@ -133,7 +147,7 @@ check "stale cache still loads when fetch fails" "$out" "stub-github-token-not-a
 check "failed fetch leaves cache intact" \
   "$([[ -s /tmp/c-fallback/env ]] && print yes || print no)" "yes"
 check "failed fetch leaves no staged file" \
-  "$(ls /tmp/c-fallback | grep -c staged)" "0"
+  "$(ls /tmp/c-fallback | grep -cE 'staged|\.raw\.')" "0"
 
 rm -rf /tmp/c-nocache
 out=$(env INFISICAL_CACHE=/tmp/c-nocache/env INFISICAL_PROJECT_ID="$PROJECT" STUB_INFISICAL_FAIL=1 \
@@ -284,6 +298,56 @@ out=$(env INFISICAL_CACHE=/tmp/c-sshnc/env INFISICAL_PROJECT_ID="$PROJECT" \
 check "sync succeeds under noclobber" "$out" "rc=0"
 check "and still writes every file" \
   "$(ls "$SSHD5" 2>/dev/null | sort | tr '\n' ' ')" "config id_rsa id_rsa.pub "
+
+print "== a deleted key comes back =="
+
+# Every one of these runs with a max age set, because that is the only
+# configuration where the question is interesting: when every shell fetches, a
+# deleted key comes back for free. With a max age, deleting a key does not make
+# the cache stale, so without the manifest the file stayed missing until the
+# cache aged out — up to twelve hours with no key and no explanation.
+SSHD6=/tmp/c-sshdir-restore
+rm -rf /tmp/c-sshrestore "$SSHD6"
+in_shell /tmp/c-sshrestore/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD6" >/dev/null
+check "manifest records what was written" \
+  "$(sort /tmp/c-sshrestore/ssh-manifest 2>/dev/null | tr '\n' ' ')" "config id_rsa id_rsa.pub "
+
+rm -f "$SSHD6/id_rsa"
+in_shell /tmp/c-sshrestore/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD6" >/dev/null
+check "deleted key is restored on next shell" \
+  "$([[ -f $SSHD6/id_rsa ]] && print yes || print no)" "yes"
+check "and at the right mode" "$(stat -c %a "$SSHD6/id_rsa")" "600"
+
+# Restoring must not have been a cache refetch — the cache was still fresh.
+rm -rf /tmp/c-sshrestore2 /tmp/c-sshdir-restore2
+in_shell /tmp/c-sshrestore2/env 'true' $TTL INFISICAL_SSH_DIR=/tmp/c-sshdir-restore2 \
+  STUB_INFISICAL_CALLS=/tmp/c-sshrestore2/log >/dev/null
+before=$(grep -c -- '--path=/ --env=' /tmp/c-sshrestore2/log)
+rm -f /tmp/c-sshdir-restore2/id_rsa
+in_shell /tmp/c-sshrestore2/env 'true' $TTL INFISICAL_SSH_DIR=/tmp/c-sshdir-restore2 \
+  STUB_INFISICAL_CALLS=/tmp/c-sshrestore2/log >/dev/null
+after=$(grep -c -- '--path=/ --env=' /tmp/c-sshrestore2/log)
+check "restoring does not refetch the secrets cache" "$(( after - before ))" "0"
+
+# With everything present, a fresh cache must still cost nothing.
+before=$(grep -c -- '--path=/ssh' /tmp/c-sshrestore2/log)
+in_shell /tmp/c-sshrestore2/env 'true' $TTL INFISICAL_SSH_DIR=/tmp/c-sshdir-restore2 \
+  STUB_INFISICAL_CALLS=/tmp/c-sshrestore2/log >/dev/null
+after=$(grep -c -- '--path=/ssh' /tmp/c-sshrestore2/log)
+check "nothing missing means no ssh call at all" "$(( after - before ))" "0"
+
+# A key dropped from the project must stop being looked for, or every shell
+# would resync forever chasing a file that is never coming back.
+check "manifest no longer lists a dropped key" \
+  "$(grep -c 'SSH_PRIVATE_KEY' /tmp/c-sshrestore/ssh-manifest 2>/dev/null)" "0"
+
+# The default configuration must restore it too, by simply fetching.
+rm -rf /tmp/c-sshrestore3 /tmp/c-sshdir-restore3
+in_shell /tmp/c-sshrestore3/env 'true' INFISICAL_SSH_DIR=/tmp/c-sshdir-restore3 >/dev/null
+rm -f /tmp/c-sshdir-restore3/id_rsa
+in_shell /tmp/c-sshrestore3/env 'true' INFISICAL_SSH_DIR=/tmp/c-sshdir-restore3 >/dev/null
+check "and a live-fetching shell restores it as well" \
+  "$([[ -f /tmp/c-sshdir-restore3/id_rsa ]] && print yes || print no)" "yes"
 
 print "== ssh file names cannot escape =="
 
