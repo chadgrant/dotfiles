@@ -1,9 +1,17 @@
 # Secrets come from Infisical, never from this repo.
 # The export is cached on disk so opening a shell costs no network round-trip.
 #
-#   secrets-refresh   re-fetch now and reload into this shell
-#   secrets-status    which environment, how old, and whether the session is live
-#   secrets-forget    delete the cache
+#   secrets-refresh    re-fetch now and reload into this shell
+#   secrets-status     which environment, how old, and whether the session is live
+#   secrets-ssh-sync   rewrite ~/.ssh from the project's ssh folder
+#   secrets-forget     delete the cache
+#
+# Two kinds of secret, kept apart by where they live in the project. Secrets at
+# the root path become environment variables. Secrets in the ssh folder become
+# files in ~/.ssh, one per secret, named by the secret's key: "id_rsa.pub"
+# becomes ~/.ssh/id_rsa.pub. Public keys are written 644 and everything else
+# 600. ~/.ssh is rewritten whenever the cache is refetched, so local edits to
+# files that are also in the project do not survive.
 #
 # The project holds one environment per machine, slugged with that machine's
 # short hostname. A machine with no environment of its own gets "default", so a
@@ -41,6 +49,20 @@
 # starts pins one environment and disables both the hostname lookup and the
 # fallback, which is how a machine borrows another's secrets deliberately.
 : ${INFISICAL_ENV=}
+
+# Key material lives in its own folder, one secret per file: the secret's key
+# is the file name and its value is the file body, so a secret called
+# "id_rsa.pub" becomes ~/.ssh/id_rsa.pub. A separate folder is what makes that
+# safe — at the root path a secret named "config" would become an environment
+# variable, and the name exclusion below only catches names starting SSH_.
+: ${INFISICAL_SSH_PATH:=/ssh}
+: ${INFISICAL_SSH_DIR:=$HOME/.ssh}
+
+# Public keys are the only thing here that is not secret. Everything else —
+# private keys, config, known_hosts, authorized_keys — is written 600, which
+# ssh accepts for all of them, so the default needs no per-name exceptions.
+: ${INFISICAL_SSH_PUBLIC_MODE:=644}
+: ${INFISICAL_SSH_PRIVATE_MODE:=600}
 
 # Names matching this never become environment variables. The SSH keys share the
 # root path with the shell variables — `infisical secrets folders create` does
@@ -128,7 +150,10 @@ _infisical_fetch_env() {
   local staged="${INFISICAL_CACHE}.staged.$$"
 
   mkdir -p -m 700 "${INFISICAL_CACHE:h}" || return 1
-  : > "$staged" && chmod 600 "$staged" || return 1
+
+  # >| rather than >: under noclobber a leftover staged file from a crashed
+  # shell with this same pid would make the fetch fail for good.
+  : >| "$staged" && chmod 600 "$staged" || return 1
 
   # JSON rather than dotenv so values can be re-quoted safely with @sh, and so
   # excluded names are dropped structurally instead of by line-matching a
@@ -180,6 +205,130 @@ _infisical_load_cache() {
 
   # The cache carries its own `export` keywords, so no allexport games needed.
   source "$INFISICAL_CACHE"
+}
+
+# File names come straight from secret keys, so they are held to a
+# conservative set. Rejecting a leading dot rules out "." and ".." outright,
+# and rejecting everything but [A-Za-z0-9._-] rules out a key like
+# "../../.bashrc" or "a/b" writing outside $INFISICAL_SSH_DIR.
+_infisical_ssh_name_ok() {
+  [[ $1 == [A-Za-z0-9_]* && $1 != *[^A-Za-z0-9._-]* ]]
+}
+
+# Writes one file at its final mode before any key material reaches it, then
+# renames it into place, so a reader never sees a half-written key and no key
+# is ever briefly world-readable.
+_infisical_ssh_write() {
+  local name=$1 json=$2 mode=$3
+  local dest="$INFISICAL_SSH_DIR/$name"
+  local staged="$dest.staged.$$"
+
+  # >| throughout: an interactive zsh very often runs with noclobber, under
+  # which a plain > onto the file just created fails and the fetch looks like a
+  # missing folder. These files are ours and are meant to be truncated.
+  {
+    : >| "$staged" && chmod 600 "$staged" || return 1
+
+    # -j, not -r: jq -r appends a newline, which would double the one most key
+    # files already end with. The value lands byte for byte.
+    jq -j --arg k "$name" '.[] | select(.key == $k) | .value' < "$json" >| "$staged" \
+      || return 1
+    [[ -s "$staged" ]] || return 1
+
+    # ssh-keygen rejects a key whose last line is unterminated. A value that
+    # already ends in a newline is left exactly as it is: the command
+    # substitution strips trailing newlines, so it is empty only in that case.
+    [[ -n $(tail -c1 "$staged") ]] && print >> "$staged"
+
+    chmod "$mode" "$staged" || return 1
+    mv -f "$staged" "$dest"
+  } always {
+    rm -f "$staged"
+  }
+}
+
+# Returns 2 when the folder does not exist in this environment, so callers can
+# try the next candidate; a machine with no keys of its own is not an error.
+_infisical_ssh_sync() {
+  local env=$1
+  local json="${INFISICAL_CACHE:h}/ssh-fetch.$$.json"
+
+  mkdir -p -m 700 "${INFISICAL_CACHE:h}" || return 1
+
+  {
+    : >| "$json" && chmod 600 "$json" || return 1
+
+    setopt localoptions pipefail
+    infisical export --silent --format=json \
+        --domain="$INFISICAL_DOMAIN" \
+        --projectId="$INFISICAL_PROJECT_ID" \
+        --path="$INFISICAL_SSH_PATH" \
+        --env="$env" \
+        </dev/null >| "$json" 2>/dev/null || return 2
+
+    local -a names
+    names=( ${(f)"$(jq -r '.[].key' < "$json" 2>/dev/null)"} )
+    (( ${#names} )) || return 2
+
+    # Created at 700 and enforced at 700: ssh refuses to use a private key from
+    # a directory others can reach.
+    mkdir -p -m 700 "$INFISICAL_SSH_DIR" || return 1
+    chmod 700 "$INFISICAL_SSH_DIR" || return 1
+
+    local name mode
+    local -a wrote
+    local -i failed=0
+    for name in $names; do
+      if ! _infisical_ssh_name_ok "$name"; then
+        print -u2 "ssh: refusing to write $INFISICAL_SSH_PATH/$name — unsafe file name"
+        (( failed++ ))
+        continue
+      fi
+
+      case $name in
+        *.pub) mode=$INFISICAL_SSH_PUBLIC_MODE ;;
+        *)     mode=$INFISICAL_SSH_PRIVATE_MODE ;;
+      esac
+
+      if _infisical_ssh_write "$name" "$json" "$mode"; then
+        wrote+=( "$name ($mode)" )
+      else
+        print -u2 "ssh: failed to write $name"
+        (( failed++ ))
+      fi
+    done
+
+    (( ${#wrote} )) && print "ssh: ${(j:, :)wrote} -> $INFISICAL_SSH_DIR (from $env:$INFISICAL_SSH_PATH)"
+    (( failed == 0 ))
+  } always {
+    rm -f "$json"
+  }
+}
+
+# Rewrites $INFISICAL_SSH_DIR from the key material in $INFISICAL_SSH_PATH.
+# Files are overwritten; nothing is ever deleted, so a key removed from the
+# project stays on disk until it is removed by hand.
+secrets-ssh-sync() {
+  if ! _infisical_is_configured; then
+    print -u2 "ssh: infisical not on PATH, or INFISICAL_PROJECT_ID is unset"
+    return 1
+  fi
+
+  if ! _infisical_has_session; then
+    print -u2 "ssh: Infisical session expired — run: $(_infisical_login_hint)"
+    return 1
+  fi
+
+  local env
+  local -i rc=0
+  for env in ${(f)"$(_infisical_env_candidates)"}; do
+    _infisical_ssh_sync "$env"
+    rc=$?
+    (( rc == 2 )) || return $rc
+  done
+
+  print -u2 "ssh: no $INFISICAL_SSH_PATH folder in any candidate environment"
+  return 1
 }
 
 secrets-refresh() {
@@ -240,6 +389,12 @@ _infisical_load_at_startup() {
   if ! _infisical_cache_is_fresh; then
     _infisical_write_cache
     rc=$?
+
+    # Tied to the refetch rather than to every shell: ~/.ssh is rewritten on
+    # the same 12h cadence as the cache, so a new machine gets its keys at
+    # first shell without every shell paying for it. The environment is taken
+    # from the cache just written, so files and variables always agree.
+    (( rc == 0 )) && _infisical_ssh_sync "$(_infisical_cache_env)"
   fi
 
   # An expired session is only worth a word once the cached values have loaded;

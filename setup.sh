@@ -24,14 +24,12 @@ INFISICAL_PROJECT_ID="${INFISICAL_PROJECT_ID:-3abbe79b-4cd2-4e68-9e76-4e59d8865f
 INFISICAL_HOST_ENV="${INFISICAL_HOST_ENV:-$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)}"
 INFISICAL_ENV_FALLBACK="${INFISICAL_ENV_FALLBACK:-default}"
 
-# Key material sits at the root path alongside everything else. Folder scoping
-# was tried and abandoned: `secrets folders create` does not honour --env, so
-# the folder was created in dev while prod kept 404ing. What keeps the private
-# key out of the shell environment is the name exclusion in
-# zsh/47-infisical.zsh, not its location in the project.
-INFISICAL_SSH_PATH="/"
-SSH_PRIVATE_KEY_SECRET="SSH_PRIVATE_KEY"
-SSH_PUBLIC_KEY_SECRET="SSH_PUBLIC_KEY"
+# Key material lives in its own folder, one secret per file: the secret's key
+# is the file name and its value is the file body. Keeping it out of the root
+# path is what stops a secret called "config" from becoming an environment
+# variable. The rule is documented in zsh/47-infisical.zsh; this file
+# implements it a second time because setup runs before any zsh config exists.
+INFISICAL_SSH_PATH="${INFISICAL_SSH_PATH:-/ssh}"
 
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 if [ "$OS" = "Darwin" ]; then
@@ -141,38 +139,86 @@ fi
 
 printf 'Using Infisical environment: %s\n\n' "$INFISICAL_ENV"
 
-# Writes one key from $INFISICAL_SSH_PATH to a file, creating nothing on
-# failure. The file is given its final mode before any key material reaches it.
-fetch_ssh_secret_to_file() {
-  local secret_name="$1"
-  local destination="$2"
-  local mode="$3"
-  local staged="${destination}.staged.$$"
+# Writes every secret in $INFISICAL_SSH_PATH into a directory, one file per
+# secret named by the secret's key. Each file gets its final mode before any
+# key material reaches it, and is renamed into place so a reader never sees a
+# half-written key.
+#
+# Returns 2 when the folder does not exist, which is not an error: a machine is
+# allowed to have no keys of its own.
+sync_ssh_folder() {
+  local dest_dir="$1"
+  local json name mode staged rc=0
 
-  install -m "$mode" /dev/null "$staged" || return 1
+  json="$(mktemp)" || return 1
+  chmod 600 "$json"
 
   # `infisical secrets get --path` 404s against this server while `export`
-  # reads the same folder correctly, so the value is pulled out of the JSON
-  # export. jq -e fails when the key is absent; -s on the file catches an
-  # empty read, since a missing secret must not look like success.
+  # reads the same folder correctly, so everything is pulled from the JSON.
   if ! as_user infisical export --silent --format=json \
         --domain="$INFISICAL_DOMAIN" \
         --projectId="$INFISICAL_PROJECT_ID" \
         --path="$INFISICAL_SSH_PATH" \
-        --env="$INFISICAL_ENV" 2>/dev/null \
-      | jq -er --arg key "$secret_name" \
-          '.[] | select(.key == $key) | .value' > "$staged" \
-      || [ ! -s "$staged" ]; then
-    rm -f "$staged"
-    return 1
+        --env="$INFISICAL_ENV" >"$json" 2>/dev/null; then
+    rm -f "$json"
+    return 2
   fi
 
-  # ssh-keygen rejects a key whose last line is unterminated. Anything already
-  # terminated is left byte-for-byte alone — trailing newlines are part of the
-  # original file and stripping them would not reproduce it.
-  [ -s "$staged" ] && [ -n "$(tail -c 1 "$staged")" ] && printf '\n' >> "$staged"
+  if [ "$(jq -r '.[].key' "$json" 2>/dev/null | wc -l)" -eq 0 ]; then
+    rm -f "$json"
+    return 2
+  fi
 
-  mv -f "$staged" "$destination"
+  mkdir -p "$dest_dir"
+  chmod 700 "$dest_dir"
+
+  # Process substitution rather than a pipe, so rc survives the loop. mapfile
+  # would be cleaner but macOS still ships bash 3.2.
+  while IFS= read -r name; do
+    # No slash and no leading dot, so a key cannot write outside $dest_dir.
+    case "$name" in
+      ''|.*|*[!A-Za-z0-9._-]*)
+        echo "Refusing to write $INFISICAL_SSH_PATH/$name — unsafe file name" >&2
+        rc=1
+        continue
+        ;;
+    esac
+
+    # Public keys are the only thing here that is not secret.
+    case "$name" in
+      *.pub) mode=644 ;;
+      *)     mode=600 ;;
+    esac
+
+    staged="$dest_dir/$name.staged.$$"
+    if ! install -m 600 /dev/null "$staged"; then
+      rc=1
+      continue
+    fi
+
+    # -j, not -r: jq -r appends a newline, which would double the one most key
+    # files already end with. An empty read must not look like success.
+    if ! jq -j --arg k "$name" '.[] | select(.key == $k) | .value' "$json" > "$staged" \
+       || [ ! -s "$staged" ]; then
+      rm -f "$staged"
+      echo "Could not read $name from Infisical ($INFISICAL_ENV)." >&2
+      rc=1
+      continue
+    fi
+
+    # ssh-keygen rejects a key whose last line is unterminated. Anything
+    # already terminated is left byte-for-byte alone.
+    if [ -n "$(tail -c 1 "$staged")" ]; then
+      printf '\n' >> "$staged"
+    fi
+
+    chmod "$mode" "$staged"
+    mv -f "$staged" "$dest_dir/$name"
+    echo "  $name ($mode)"
+  done < <(jq -r '.[].key' "$json")
+
+  rm -f "$json"
+  return "$rc"
 }
 
 printf '\n\nSetting up SSH ...\n\n'
@@ -185,25 +231,27 @@ curl -fsSL https://raw.githubusercontent.com/chadgrant/dotfiles/refs/heads/maste
 echo "$EXPECTED_HASH  /tmp/ak" | sha256sum -c || exit 1
 mv /tmp/ak "$TARGET_HOME/.ssh/authorized_keys"
 
-if [ -f "$TARGET_HOME/.ssh/id_rsa" ] && [ -f "$TARGET_HOME/.ssh/id_rsa.pub" ]; then
-  echo "SSH key already present at $TARGET_HOME/.ssh/id_rsa, skipping key import."
-else
-  printf 'Pulling SSH keypair from Infisical ...\n'
+# After authorized_keys above, so the project wins over the published copy if
+# it carries one. Files are overwritten every run, matching the shell, which
+# resyncs on the same schedule as the secrets cache.
+printf 'Syncing SSH files from Infisical (%s:%s) ...\n' "$INFISICAL_ENV" "$INFISICAL_SSH_PATH"
 
-  if ! fetch_ssh_secret_to_file "$SSH_PRIVATE_KEY_SECRET" "$TARGET_HOME/.ssh/id_rsa" 600; then
-    echo "Could not read $SSH_PRIVATE_KEY_SECRET from Infisical ($INFISICAL_ENV)." >&2
-    echo "Upload it first:  infisical secrets set $SSH_PRIVATE_KEY_SECRET=@$TARGET_HOME/.ssh/id_rsa --path=$INFISICAL_SSH_PATH --projectId=$INFISICAL_PROJECT_ID --env=$INFISICAL_ENV" >&2
-    exit 1
-  fi
+set +e
+sync_ssh_folder "$TARGET_HOME/.ssh"
+sync_rc=$?
+set -e
 
-  if ! fetch_ssh_secret_to_file "$SSH_PUBLIC_KEY_SECRET" "$TARGET_HOME/.ssh/id_rsa.pub" 644; then
-    echo "Could not read $SSH_PUBLIC_KEY_SECRET from Infisical ($INFISICAL_ENV)." >&2
-    echo "Upload it first:  infisical secrets set $SSH_PUBLIC_KEY_SECRET=@$TARGET_HOME/.ssh/id_rsa.pub --path=$INFISICAL_SSH_PATH --projectId=$INFISICAL_PROJECT_ID --env=$INFISICAL_ENV" >&2
-    exit 1
-  fi
+case "$sync_rc" in
+  0) ;;
+  2) echo "No $INFISICAL_SSH_PATH folder in $INFISICAL_ENV — no SSH files imported." >&2 ;;
+  *) echo "One or more SSH files could not be written." >&2
+     exit 1 ;;
+esac
 
+# Only meaningful if the project actually carries a key by this name.
+if [ -f "$TARGET_HOME/.ssh/id_rsa" ]; then
   if ! grep -q -- "-----BEGIN .*PRIVATE KEY-----" "$TARGET_HOME/.ssh/id_rsa"; then
-    echo "$SSH_PRIVATE_KEY_SECRET does not contain a private key." >&2
+    echo "$INFISICAL_SSH_PATH/id_rsa does not contain a private key." >&2
     exit 1
   fi
 

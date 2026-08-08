@@ -12,15 +12,22 @@
 #   STUB_INFISICAL_ENVS        space-separated environments that exist; any
 #                              other --env 404s the way the real server does.
 #                              Unset means every environment exists.
+#   STUB_INFISICAL_NO_SSH_FOLDER=1
+#                              make --path=/ssh 404, as a project without an
+#                              ssh folder would
+#   STUB_INFISICAL_SSH_HOSTILE=1
+#                              serve secret keys that try to escape ~/.ssh
 
 [ -n "${STUB_INFISICAL_CALLS:-}" ] && echo "$*" >> "$STUB_INFISICAL_CALLS"
 
 # Pulled out because the export branch needs it both to decide whether the
 # environment exists and to vary what it returns.
 requested_env=default
+requested_path=/
 for arg in "$@"; do
   case "$arg" in
-    --env=*) requested_env="${arg#--env=}" ;;
+    --env=*)  requested_env="${arg#--env=}" ;;
+    --path=*) requested_path="${arg#--path=}" ;;
   esac
 done
 
@@ -62,6 +69,23 @@ case "$1" in
         exit 1
       fi
     fi
+
+    # The ssh folder is a separate fixture; STUB_INFISICAL_NO_SSH_FOLDER makes
+    # it 404 the way a project without that folder would.
+    case "$requested_path" in
+      /ssh)
+        if [ "${STUB_INFISICAL_NO_SSH_FOLDER:-0}" = "1" ]; then
+          echo "Message: Folder with path '/ssh' was not found." >&2
+          exit 1
+        fi
+        if [ "${STUB_INFISICAL_SSH_HOSTILE:-0}" = "1" ]; then
+          cat /opt/test/ssh-secrets-hostile.json
+        else
+          cat /opt/test/ssh-secrets.json
+        fi
+        exit 0
+        ;;
+    esac
 
     # Tag one secret with the environment so a test can prove which one won.
     sed "s/__ENV__/$requested_env/g" /opt/test/secrets.json

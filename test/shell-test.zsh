@@ -20,11 +20,16 @@ check() {
 }
 
 # Each case runs in its own shell so nothing leaks between them.
+#
+# noclobber is set because prezto and most interactive setups do, and it broke
+# the ssh sync once: under it a plain > onto a file we had just created fails,
+# which looked exactly like a missing folder. A plain `zsh -c` does not set it,
+# so without this the suite tests a shell nobody actually runs.
 in_shell() {
   local cache=$1 body=$2
   shift 2
   env "$@" INFISICAL_CACHE="$cache" INFISICAL_PROJECT_ID="$PROJECT" \
-    zsh -c "source $ZSHRC >/dev/null 2>&1; $body" 2>/dev/null
+    zsh -c "setopt noclobber; source $ZSHRC >/dev/null 2>&1; $body" 2>/dev/null
 }
 
 print "== shell loads =="
@@ -94,9 +99,10 @@ check "secrets-refresh refetches and reloads" "$out" "stub-github-token-not-a-re
 
 print "== a fresh cache is not refetched =="
 
-# Counts export calls specifically — the session check is a separate call and
-# is not what "refetch" means here.
-exports() { grep -c '^export' /tmp/c-calls/log; }
+# Counts root-path export calls specifically. The session check is a separate
+# call, and the ssh folder is fetched with its own export, so neither is what
+# "refetch" means here.
+exports() { grep -c -- '--path=/ --env=' /tmp/c-calls/log; }
 
 rm -rf /tmp/c-calls; mkdir -p /tmp/c-calls
 in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
@@ -224,6 +230,116 @@ check "warns that the session expired" "$out" "1"
 out=$(in_shell /tmp/c-expired/env 'secrets-refresh 2>&1 >/dev/null' STUB_INFISICAL_EXPIRED=1 2>&1)
 check "secrets-refresh names the real cause" \
   "$(print -r -- "$out" | grep -c 'session expired')" "1"
+
+print "== ssh key files =="
+
+# Last two bytes as hex — proves a trailing newline is present exactly once,
+# which ssh-keygen cares about and a naive jq -r would get wrong.
+last2() { tail -c2 "$1" | od -An -tx1 | tr -d ' \n' }
+
+SSHD=/tmp/c-sshdir
+rm -rf /tmp/c-sshsync "$SSHD"
+in_shell /tmp/c-sshsync/env 'true' INFISICAL_SSH_DIR="$SSHD" >/dev/null
+
+check "secret key becomes a file of the same name" \
+  "$(ls "$SSHD" 2>/dev/null | sort | tr '\n' ' ')" "config id_rsa id_rsa.pub "
+
+check "private key mode" "$(stat -c %a "$SSHD/id_rsa")" "600"
+check "public key mode"  "$(stat -c %a "$SSHD/id_rsa.pub")" "644"
+check "config mode"      "$(stat -c %a "$SSHD/config")" "600"
+check "ssh dir mode"     "$(stat -c %a "$SSHD")" "700"
+
+# The fixture private key is 4 lines and already newline-terminated, so a
+# doubled newline would show as 0a0a and an extra line.
+check "multi-line key body intact" "$(wc -l < "$SSHD/id_rsa" | tr -d ' ')" "4"
+check "no doubled trailing newline" "$(last2 "$SSHD/id_rsa")" "2d0a"
+
+# The fixture config deliberately has no trailing newline; exactly one is added.
+check "missing trailing newline added" "$(last2 "$SSHD/config")" "620a"
+check "and only one" "$(wc -l < "$SSHD/config" | tr -d ' ')" "2"
+
+check "sync leaves no staged file" "$(ls -a "$SSHD" | grep -c staged)" "0"
+check "sync leaves no fetch temp" "$(ls /tmp/c-sshsync | grep -c ssh-fetch)" "0"
+
+# Overwriting is the point: a stale local file must be replaced, and a loosened
+# mode tightened back.
+print 'stale' > "$SSHD/id_rsa"
+chmod 666 "$SSHD/id_rsa"
+rm -f /tmp/c-sshsync/env
+in_shell /tmp/c-sshsync/env 'true' INFISICAL_SSH_DIR="$SSHD" >/dev/null
+check "existing file is overwritten" "$(wc -l < "$SSHD/id_rsa" | tr -d ' ')" "4"
+check "and its mode reset" "$(stat -c %a "$SSHD/id_rsa")" "600"
+
+# Named separately from the in_shell default so the regression is visible: the
+# sync reported "no /ssh folder" on every interactive shell until the redirects
+# became >|, because > refuses to truncate a file that already exists.
+SSHD5=/tmp/c-sshdir-noclobber
+rm -rf /tmp/c-sshnc "$SSHD5"
+out=$(env INFISICAL_CACHE=/tmp/c-sshnc/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_SSH_DIR="$SSHD5" \
+  zsh -c "setopt noclobber
+          source $ZSHRC >/dev/null 2>&1
+          secrets-ssh-sync >/dev/null 2>&1
+          print rc=\$?" 2>/dev/null)
+check "sync succeeds under noclobber" "$out" "rc=0"
+check "and still writes every file" \
+  "$(ls "$SSHD5" 2>/dev/null | sort | tr '\n' ' ')" "config id_rsa id_rsa.pub "
+
+print "== ssh file names cannot escape =="
+
+SSHD2=/tmp/c-sshdir-hostile
+rm -rf /tmp/c-sshhostile "$SSHD2" /pwned
+in_shell /tmp/c-sshhostile/env 'true' INFISICAL_SSH_DIR="$SSHD2" \
+  STUB_INFISICAL_SSH_HOSTILE=1 >/dev/null
+
+check "the safe key is still written" \
+  "$([[ -f $SSHD2/id_rsa ]] && print yes || print no)" "yes"
+check "nothing escaped the ssh directory" \
+  "$([[ -e /pwned || -e $SSHD2/nested || -e $SSHD2/.bashrc ]] && print escaped || print contained)" \
+  "contained"
+check "only the safe name was written" \
+  "$(ls "$SSHD2" | sort | tr '\n' ' ')" "id_rsa "
+
+out=$(env INFISICAL_CACHE=/tmp/c-sshhostile2/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_SSH_DIR=/tmp/c-sshdir-hostile2 STUB_INFISICAL_SSH_HOSTILE=1 \
+  zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "unsafe file name")
+check "each unsafe name is refused loudly" "$out" "3"
+
+print "== ssh folder is optional =="
+
+SSHD3=/tmp/c-sshdir-none
+rm -rf /tmp/c-sshnone "$SSHD3"
+out=$(env INFISICAL_CACHE=/tmp/c-sshnone/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_SSH_DIR="$SSHD3" STUB_INFISICAL_NO_SSH_FOLDER=1 \
+  zsh -c "source $ZSHRC >/dev/null 2>&1; print ok" 2>/dev/null)
+check "a project with no ssh folder still loads" "$out" "ok"
+check "and no ssh directory is created" \
+  "$([[ -e $SSHD3 ]] && print present || print absent)" "absent"
+
+out=$(env INFISICAL_CACHE=/tmp/c-sshnone2/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_SSH_DIR=/tmp/c-sshdir-none2 STUB_INFISICAL_NO_SSH_FOLDER=1 \
+  zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "ssh:")
+check "and it says nothing at startup" "$out" "0"
+
+# Secrets must never be exported into the environment as a side effect.
+out=$(in_shell /tmp/c-sshenv/env 'print "${id_rsa:-unset}/${config:-unset}"' \
+  INFISICAL_SSH_DIR=/tmp/c-sshdir-env)
+check "ssh secrets do not become variables" "$out" "unset/unset"
+
+print "== secrets-ssh-sync on demand =="
+
+SSHD4=/tmp/c-sshdir-cmd
+rm -rf /tmp/c-sshcmd "$SSHD4"
+out=$(in_shell /tmp/c-sshcmd/env 'secrets-ssh-sync' INFISICAL_SSH_DIR="$SSHD4")
+check "reports what it wrote and at which mode" \
+  "$(print -r -- "$out" | grep -c 'id_rsa (600).*id_rsa.pub (644)')" "1"
+check "wrote the files" \
+  "$(ls "$SSHD4" 2>/dev/null | sort | tr '\n' ' ')" "config id_rsa id_rsa.pub "
+
+out=$(in_shell /tmp/c-sshcmd/env 'secrets-ssh-sync 2>&1 >/dev/null' \
+  INFISICAL_SSH_DIR=/tmp/c-sshdir-cmd2 STUB_INFISICAL_NO_SSH_FOLDER=1 2>&1)
+check "says so when there is no ssh folder" \
+  "$(print -r -- "$out" | grep -c 'no /ssh folder')" "1"
 
 print "== missing dependencies degrade quietly =="
 

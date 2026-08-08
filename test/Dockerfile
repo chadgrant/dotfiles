@@ -21,6 +21,8 @@ RUN chmod 0755 /opt/stub/infisical
 ENV PATH="/opt/stub:${PATH}"
 
 COPY test/secrets.json /opt/test/secrets.json
+COPY test/ssh-secrets.json /opt/test/ssh-secrets.json
+COPY test/ssh-secrets-hostile.json /opt/test/ssh-secrets-hostile.json
 
 COPY zshrc /opt/dotfiles/zshrc
 COPY zsh /opt/dotfiles/zsh
