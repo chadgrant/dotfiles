@@ -14,7 +14,15 @@ esac
 # Project "secret-management"; override any of these to bootstrap from elsewhere.
 INFISICAL_DOMAIN="${INFISICAL_DOMAIN:-https://infisical.deviantgeek.io}"
 INFISICAL_PROJECT_ID="${INFISICAL_PROJECT_ID:-3abbe79b-4cd2-4e68-9e76-4e59d8865f92}"
-INFISICAL_ENV="${INFISICAL_ENV:-prod}"
+
+# The project holds one environment per machine, slugged with that machine's
+# short hostname, falling back to "default" — same rule as zsh/47-infisical.zsh,
+# which is where it is documented. INFISICAL_ENV is resolved after login, since
+# deciding which of the two exists takes an authenticated call.
+# `|| true` because set -e would abort the whole script if a machine had no
+# hostname command; an empty host env just means the fallback is used.
+INFISICAL_HOST_ENV="${INFISICAL_HOST_ENV:-$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)}"
+INFISICAL_ENV_FALLBACK="${INFISICAL_ENV_FALLBACK:-default}"
 
 # Key material sits at the root path alongside everything else. Folder scoping
 # was tried and abandoned: `secrets folders create` does not honour --env, so
@@ -108,6 +116,30 @@ if ! as_user infisical login --domain="$INFISICAL_DOMAIN"; then
   echo "  infisical login --domain=$INFISICAL_DOMAIN" >&2
   exit 1
 fi
+
+# An environment that does not exist 404s, so existence is discovered by trying
+# it. An explicit INFISICAL_ENV pins the choice and skips both probes.
+if [ -z "${INFISICAL_ENV:-}" ]; then
+  for candidate in "$INFISICAL_HOST_ENV" "$INFISICAL_ENV_FALLBACK"; do
+    [ -n "$candidate" ] || continue
+    if as_user infisical export --silent --format=json \
+         --domain="$INFISICAL_DOMAIN" \
+         --projectId="$INFISICAL_PROJECT_ID" \
+         --path="$INFISICAL_SSH_PATH" \
+         --env="$candidate" >/dev/null 2>&1; then
+      INFISICAL_ENV="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -z "${INFISICAL_ENV:-}" ]; then
+  echo "No Infisical environment for this machine ($INFISICAL_HOST_ENV) and no" >&2
+  echo "$INFISICAL_ENV_FALLBACK environment to fall back to. Create one, then re-run setup.sh." >&2
+  exit 1
+fi
+
+printf 'Using Infisical environment: %s\n\n' "$INFISICAL_ENV"
 
 # Writes one key from $INFISICAL_SSH_PATH to a file, creating nothing on
 # failure. The file is given its final mode before any key material reaches it.

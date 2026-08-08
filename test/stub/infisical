@@ -9,8 +9,20 @@
 #                              stdout instead of JSON
 #   STUB_INFISICAL_CALLS       file to append one line per call, for asserting
 #                              that a fresh cache does not re-fetch
+#   STUB_INFISICAL_ENVS        space-separated environments that exist; any
+#                              other --env 404s the way the real server does.
+#                              Unset means every environment exists.
 
 [ -n "${STUB_INFISICAL_CALLS:-}" ] && echo "$*" >> "$STUB_INFISICAL_CALLS"
+
+# Pulled out because the export branch needs it both to decide whether the
+# environment exists and to vary what it returns.
+requested_env=default
+for arg in "$@"; do
+  case "$arg" in
+    --env=*) requested_env="${arg#--env=}" ;;
+  esac
+done
 
 case "$1 $2" in
   "login status")
@@ -36,7 +48,23 @@ case "$1" in
       echo "stub: simulated unreachable server" >&2
       exit 1
     fi
-    cat /opt/test/secrets.json
+
+    # A missing environment is a 404 on stderr and a non-zero exit, exactly as
+    # the real server answers for an environment slug that does not exist.
+    if [ -n "${STUB_INFISICAL_ENVS:-}" ]; then
+      found=0
+      for e in $STUB_INFISICAL_ENVS; do
+        [ "$e" = "$requested_env" ] && found=1
+      done
+      if [ "$found" = "0" ]; then
+        echo "Message: Folder with path '/' in environment '$requested_env' was not found." >&2
+        echo "  • Unable to fetch secrets" >&2
+        exit 1
+      fi
+    fi
+
+    # Tag one secret with the environment so a test can prove which one won.
+    sed "s/__ENV__/$requested_env/g" /opt/test/secrets.json
     ;;
   *)
     echo "stub: unsupported command: $*" >&2

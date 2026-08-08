@@ -2,8 +2,14 @@
 # The export is cached on disk so opening a shell costs no network round-trip.
 #
 #   secrets-refresh   re-fetch now and reload into this shell
-#   secrets-status    where the cache came from and whether it is stale
+#   secrets-status    which environment, how old, and whether the session is live
 #   secrets-forget    delete the cache
+#
+# The project holds one environment per machine, slugged with that machine's
+# short hostname. A machine with no environment of its own gets "default", so a
+# new box works before it has been given any secrets of its own. Export
+# INFISICAL_ENV before the shell starts to pin one environment and skip both
+# steps.
 #
 # Anything in ~/.extra is sourced later and therefore wins over these values.
 #
@@ -17,15 +23,31 @@
 # the shell starts turns Infisical off for that machine. Using := here would
 # substitute the default over the empty value and re-enable it.
 : ${INFISICAL_PROJECT_ID=3abbe79b-4cd2-4e68-9e76-4e59d8865f92}
-: ${INFISICAL_ENV:=prod}
 : ${INFISICAL_CACHE:=$HOME/.cache/infisical/env}
 : ${INFISICAL_CACHE_MAX_AGE_HOURS:=12}
 
+# The project keeps one environment per machine, named for that machine. The
+# short hostname is lowercased because Infisical slugs environments that way,
+# and the domain is stripped so a Mac reporting "Foo-MacBook-Pro.local" and the
+# same box on a different network both resolve to "foo-macbook-pro".
+: ${INFISICAL_HOST_ENV:=${${HOST%%.*}:l}}
+
+# A machine with no environment of its own falls back to this one rather than
+# starting with no secrets at all.
+: ${INFISICAL_ENV_FALLBACK:=default}
+
+# Left unset on purpose: it is the *resolved* environment, decided per fetch by
+# _infisical_env_candidates. Setting it in the environment before the shell
+# starts pins one environment and disables both the hostname lookup and the
+# fallback, which is how a machine borrows another's secrets deliberately.
+: ${INFISICAL_ENV=}
+
 # Names matching this never become environment variables. The SSH keys share the
 # root path with the shell variables — `infisical secrets folders create` does
-# not honour --env, so a separate folder could not be made to work in prod — and
-# a private key in every process's environment is not acceptable. Excluding by
-# name keeps that guarantee local, independent of how the project is laid out.
+# not honour --env, so a separate folder could not be made to work per
+# environment — and a private key in every process's environment is not
+# acceptable. Excluding by name keeps that guarantee local, independent of how
+# the project is laid out.
 : ${INFISICAL_ENV_EXCLUDE:='^SSH_'}
 
 _infisical_is_configured() {
@@ -56,6 +78,36 @@ _infisical_has_session() {
   infisical login status --silent >/dev/null 2>&1 </dev/null
 }
 
+# The environments to try, best first. An explicit INFISICAL_ENV pins the
+# choice; otherwise this machine's own environment is preferred and the
+# fallback is tried only if that one does not exist.
+#
+# There is no cheap way to ask "does this environment exist?" — `infisical
+# secrets` 404s against this server even for environments that do exist, so
+# existence is discovered by attempting the export and seeing it fail.
+_infisical_env_candidates() {
+  if [[ -n "$INFISICAL_ENV" ]]; then
+    print -r -- "$INFISICAL_ENV"
+    return 0
+  fi
+
+  [[ -n "$INFISICAL_HOST_ENV" ]] && print -r -- "$INFISICAL_HOST_ENV"
+  [[ -n "$INFISICAL_ENV_FALLBACK" && "$INFISICAL_ENV_FALLBACK" != "$INFISICAL_HOST_ENV" ]] \
+    && print -r -- "$INFISICAL_ENV_FALLBACK"
+
+  return 0
+}
+
+# The cache records which environment produced it on its first line, so
+# secrets-status can report the resolved environment without a network call.
+# A comment is safe here because the cache is sourced by zsh.
+_infisical_cache_env() {
+  local line
+  read -r line < "$INFISICAL_CACHE" 2>/dev/null || return 1
+  [[ $line == '# env='* ]] || return 1
+  print -r -- "${line#\# env=}"
+}
+
 _infisical_cache_is_fresh() {
   [[ -r "$INFISICAL_CACHE" ]] || return 1
 
@@ -69,14 +121,10 @@ _infisical_cache_is_fresh() {
   (( EPOCHSECONDS - cache_stat[1] < INFISICAL_CACHE_MAX_AGE_HOURS * 3600 ))
 }
 
-# Fetches into a staged file so a failed export never truncates a good cache,
-# and so the secrets are never briefly world-readable.
-#
-# Returns 2 — distinct from any other failure — when the session is expired, so
-# callers can say "log in again" rather than "the server is unreachable".
-_infisical_write_cache() {
-  _infisical_has_session || return 2
-
+# Fetches one environment into a staged file, so a failed export never
+# truncates a good cache and the secrets are never briefly world-readable.
+_infisical_fetch_env() {
+  local env=$1
   local staged="${INFISICAL_CACHE}.staged.$$"
 
   mkdir -p -m 700 "${INFISICAL_CACHE:h}" || return 1
@@ -91,11 +139,13 @@ _infisical_write_cache() {
   # the success path leaves nothing for it to remove. stdin is closed because a
   # CLI that decides to prompt must fail rather than block a login shell.
   {
+    print -r -- "# env=$env" >> "$staged" || return 1
+
     if ! infisical export --silent --format=json \
           --domain="$INFISICAL_DOMAIN" \
           --projectId="$INFISICAL_PROJECT_ID" \
           --path=/ \
-          --env="$INFISICAL_ENV" \
+          --env="$env" \
           </dev/null \
         | jq -r --arg exclude "$INFISICAL_ENV_EXCLUDE" \
             '.[] | select(.key | test($exclude) | not)
@@ -108,6 +158,21 @@ _infisical_write_cache() {
   } always {
     rm -f "$staged"
   }
+}
+
+# Tries each candidate environment in turn and keeps the first that exists.
+#
+# Returns 2 — distinct from any other failure — when the session is expired, so
+# callers can say "log in again" rather than "the server is unreachable".
+_infisical_write_cache() {
+  _infisical_has_session || return 2
+
+  local env
+  for env in ${(f)"$(_infisical_env_candidates)"}; do
+    _infisical_fetch_env "$env" && return 0
+  done
+
+  return 1
 }
 
 _infisical_load_cache() {
@@ -150,7 +215,17 @@ secrets-status() {
   # Count assignments, not lines — a multi-line value would inflate a line count.
   local -i count=$(grep -cE '^export [A-Za-z_][A-Za-z0-9_]*=' "$INFISICAL_CACHE")
 
-  print "secrets: $count entries, cache $freshness, session $session, from $(_infisical_recorded_domain) ($INFISICAL_ENV)"
+  local env=$(_infisical_cache_env)
+  local origin
+  case $env in
+    "")                       env=unknown; origin="cache predates env tracking" ;;
+    "$INFISICAL_HOST_ENV")    origin="this machine" ;;
+    "$INFISICAL_ENV_FALLBACK") origin="fallback, no environment named $INFISICAL_HOST_ENV" ;;
+    *)                        origin="pinned via INFISICAL_ENV" ;;
+  esac
+
+  print "secrets: $count entries, cache $freshness, session $session, from $(_infisical_recorded_domain)"
+  print "  environment: $env ($origin)"
   [[ $session == valid ]] || print "  run: $(_infisical_login_hint)"
 }
 

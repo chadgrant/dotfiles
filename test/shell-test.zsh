@@ -78,7 +78,7 @@ out=$(in_shell /tmp/c-quote/env 'print -r -- "$TRICKY_VALUE"')
 check "hostile value round-trips verbatim" "$out" 'it'"'"'s "quoted" $HOME `backtick` \ end'
 
 out=$(in_shell /tmp/c-count/env 'secrets-status')
-check "status counts only exported entries" "${out%% entries*}" "secrets: 2"
+check "status counts only exported entries" "${out%% entries*}" "secrets: 3"
 
 print "== refresh, forget =="
 
@@ -137,6 +137,62 @@ check "shell usable with no cache and no server" "$out" "still-usable"
 out=$(env INFISICAL_CACHE=/tmp/c-nocache/env INFISICAL_PROJECT_ID="$PROJECT" STUB_INFISICAL_FAIL=1 \
   zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "secrets:")
 check "and warns on stderr" "$out" "1"
+
+print "== one environment per machine =="
+
+out=$(in_shell /tmp/c-hostenv/env 'print "$INFISICAL_HOST_ENV"')
+check "host env is the short hostname, lowercased" \
+  "$out" "$(hostname -s | tr '[:upper:]' '[:lower:]')"
+
+# WHICH_ENV is stamped by the stub with whichever environment it served, so it
+# proves which candidate actually won rather than just that something loaded.
+rm -rf /tmp/c-envhost
+out=$(in_shell /tmp/c-envhost/env 'print "$WHICH_ENV"' \
+  INFISICAL_HOST_ENV=allcode STUB_INFISICAL_ENVS="allcode default")
+check "machine environment wins over the fallback" "$out" "allcode"
+
+rm -rf /tmp/c-envskip; mkdir -p /tmp/c-envskip
+in_shell /tmp/c-envskip/env 'true' INFISICAL_HOST_ENV=allcode \
+  STUB_INFISICAL_ENVS="allcode default" STUB_INFISICAL_CALLS=/tmp/c-envskip/log >/dev/null
+check "fallback not fetched when the machine has its own" \
+  "$(grep -c 'env=default' /tmp/c-envskip/log)" "0"
+
+rm -rf /tmp/c-envfall
+out=$(in_shell /tmp/c-envfall/env 'print "$WHICH_ENV"' \
+  INFISICAL_HOST_ENV=unknown-box STUB_INFISICAL_ENVS="default")
+check "machine with no environment falls back to default" "$out" "default"
+
+check "falling back leaves no staged file" \
+  "$(ls /tmp/c-envfall | grep -c staged)" "0"
+
+out=$(in_shell /tmp/c-envfall/env 'secrets-status' \
+  INFISICAL_HOST_ENV=unknown-box STUB_INFISICAL_ENVS="default" \
+  | grep -c 'environment: default (fallback')
+check "status names the environment and why" "$out" "1"
+
+# Neither the machine's environment nor the fallback exists.
+rm -rf /tmp/c-envnone
+out=$(env INFISICAL_CACHE=/tmp/c-envnone/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_HOST_ENV=unknown-box STUB_INFISICAL_ENVS="somewhere-else" \
+  zsh -c "source $ZSHRC >/dev/null 2>&1; print ok" 2>/dev/null)
+check "shell usable when nothing matches" "$out" "ok"
+check "and writes no cache" \
+  "$([[ -e /tmp/c-envnone/env ]] && print present || print absent)" "absent"
+
+# Pinning is how a machine deliberately borrows another's secrets.
+rm -rf /tmp/c-envpin
+out=$(in_shell /tmp/c-envpin/env 'print "$WHICH_ENV"' \
+  INFISICAL_ENV=staging INFISICAL_HOST_ENV=allcode \
+  STUB_INFISICAL_ENVS="staging allcode default")
+check "explicit INFISICAL_ENV pins the environment" "$out" "staging"
+
+rm -rf /tmp/c-envpin2
+env INFISICAL_CACHE=/tmp/c-envpin2/env INFISICAL_PROJECT_ID="$PROJECT" \
+  INFISICAL_ENV=nonexistent INFISICAL_HOST_ENV=allcode \
+  STUB_INFISICAL_ENVS="allcode default" \
+  zsh -c "source $ZSHRC >/dev/null 2>&1" >/dev/null 2>&1
+check "a pinned environment never falls back" \
+  "$([[ -e /tmp/c-envpin2/env ]] && print present || print absent)" "absent"
 
 print "== expired session =="
 
