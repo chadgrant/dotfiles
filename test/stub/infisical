@@ -2,14 +2,36 @@
 # Stand-in for the Infisical CLI so the shell integration can be tested with no
 # credentials, no network, and a fixed set of secrets.
 #
-#   STUB_INFISICAL_FAIL=1   make `export` fail, as an unreachable server would
-#   STUB_INFISICAL_CALLS    file to append one line per call, for asserting
-#                           that a fresh cache does not re-fetch
+#   STUB_INFISICAL_FAIL=1      make `export` fail, as an unreachable server would
+#   STUB_INFISICAL_EXPIRED=1   make `login status` fail, as an expired session
+#                              would, and have `export` reproduce the real CLI's
+#                              behaviour of writing an interactive picker to
+#                              stdout instead of JSON
+#   STUB_INFISICAL_CALLS       file to append one line per call, for asserting
+#                              that a fresh cache does not re-fetch
 
 [ -n "${STUB_INFISICAL_CALLS:-}" ] && echo "$*" >> "$STUB_INFISICAL_CALLS"
 
+case "$1 $2" in
+  "login status")
+    if [ "${STUB_INFISICAL_EXPIRED:-0}" = "1" ]; then
+      echo "x Failed to authenticate: session expired"
+      exit 1
+    fi
+    echo "Authenticated"
+    exit 0
+    ;;
+esac
+
 case "$1" in
   export)
+    if [ "${STUB_INFISICAL_EXPIRED:-0}" = "1" ]; then
+      # Deliberately on stdout, and deliberately not JSON: this is what fed the
+      # jq parse error the session guard now prevents.
+      echo "? Select your hosting option:"
+      echo "  > Infisical Cloud (US Region)"
+      exit 1
+    fi
     if [ "${STUB_INFISICAL_FAIL:-0}" = "1" ]; then
       echo "stub: simulated unreachable server" >&2
       exit 1

@@ -94,17 +94,26 @@ check "secrets-refresh refetches and reloads" "$out" "stub-github-token-not-a-re
 
 print "== a fresh cache is not refetched =="
 
+# Counts export calls specifically — the session check is a separate call and
+# is not what "refetch" means here.
+exports() { grep -c '^export' /tmp/c-calls/log; }
+
 rm -rf /tmp/c-calls; mkdir -p /tmp/c-calls
 in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
-first=$(wc -l < /tmp/c-calls/log | tr -d ' ')
+first=$(exports)
 in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
-second=$(wc -l < /tmp/c-calls/log | tr -d ' ')
+second=$(exports)
 check "second shell makes no new call" "$second" "$first"
+
+# A fresh cache must not even ask whether the session is valid — that is a
+# process spawn on the critical path of every interactive shell.
+check "fresh cache checks no session" \
+  "$(grep -c 'login status' /tmp/c-calls/log)" "1"
 
 # Backdating past the 12h window must trigger exactly one more fetch.
 touch -d '20 hours ago' /tmp/c-calls/env
 in_shell /tmp/c-calls/env 'true' STUB_INFISICAL_CALLS=/tmp/c-calls/log >/dev/null
-third=$(wc -l < /tmp/c-calls/log | tr -d ' ')
+third=$(exports)
 check "stale cache triggers a refetch" "$(( third - second ))" "1"
 
 print "== server unreachable =="
@@ -128,6 +137,37 @@ check "shell usable with no cache and no server" "$out" "still-usable"
 out=$(env INFISICAL_CACHE=/tmp/c-nocache/env INFISICAL_PROJECT_ID="$PROJECT" STUB_INFISICAL_FAIL=1 \
   zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "secrets:")
 check "and warns on stderr" "$out" "1"
+
+print "== expired session =="
+
+# The regression this guards: `infisical export` with no session writes an
+# interactive picker to stdout, jq chokes on it, and the shell prints
+# "jq: parse error: Invalid numeric literal".
+rm -rf /tmp/c-expired
+in_shell /tmp/c-expired/env 'true' >/dev/null
+touch -d '20 hours ago' /tmp/c-expired/env
+
+out=$(env INFISICAL_CACHE=/tmp/c-expired/env INFISICAL_PROJECT_ID="$PROJECT" \
+  STUB_INFISICAL_EXPIRED=1 zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "parse error")
+check "no jq parse error on expired session" "$out" "0"
+
+out=$(in_shell /tmp/c-expired/env 'print "$GITHUB_TOKEN"' STUB_INFISICAL_EXPIRED=1)
+check "cached secrets still load" "$out" "stub-github-token-not-a-real-pat"
+
+check "expired fetch leaves cache intact" \
+  "$([[ -s /tmp/c-expired/env ]] && print yes || print no)" "yes"
+check "expired fetch leaves no staged file" \
+  "$(ls /tmp/c-expired | grep -c staged)" "0"
+
+out=$(env INFISICAL_CACHE=/tmp/c-expired/env INFISICAL_PROJECT_ID="$PROJECT" \
+  STUB_INFISICAL_EXPIRED=1 zsh -c "source $ZSHRC >/dev/null" 2>&1 | grep -c "session expired")
+check "warns that the session expired" "$out" "1"
+
+# An expired session must never be reported as an unreachable server, since the
+# fix for each is different.
+out=$(in_shell /tmp/c-expired/env 'secrets-refresh 2>&1 >/dev/null' STUB_INFISICAL_EXPIRED=1 2>&1)
+check "secrets-refresh names the real cause" \
+  "$(print -r -- "$out" | grep -c 'session expired')" "1"
 
 print "== missing dependencies degrade quietly =="
 
