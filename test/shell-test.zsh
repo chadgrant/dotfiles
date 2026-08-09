@@ -349,6 +349,61 @@ in_shell /tmp/c-sshrestore3/env 'true' INFISICAL_SSH_DIR=/tmp/c-sshdir-restore3 
 check "and a live-fetching shell restores it as well" \
   "$([[ -f /tmp/c-sshdir-restore3/id_rsa ]] && print yes || print no)" "yes"
 
+print "== a loosened mode is tightened back =="
+
+# ssh refuses a key that others can read, so a file left at the wrong mode is
+# as unusable as one that is missing. Modes used to be set only as a side
+# effect of *writing* a file, which meant nothing enforced them on the shells
+# that do not write: a fresh cache, an unreachable server, an expired session.
+# A key chmod'ed 644 by a stray tool or a restored backup then stayed 644.
+loosen() { chmod 644 "$1/id_rsa"; chmod 755 "$1" }
+
+# A fresh cache does no fetch at all, so this is repaired locally or not at all.
+SSHD7=/tmp/c-sshdir-modes
+rm -rf /tmp/c-sshmodes "$SSHD7"
+in_shell /tmp/c-sshmodes/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD7" >/dev/null
+loosen "$SSHD7"
+in_shell /tmp/c-sshmodes/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD7" >/dev/null
+check "fresh cache still tightens the key" "$(stat -c %a "$SSHD7/id_rsa")" "600"
+check "and the directory" "$(stat -c %a "$SSHD7")" "700"
+
+# A public key is the one file here that is meant to stay readable; tightening
+# everything to 600 would be just as wrong as leaving the private key at 644.
+chmod 600 "$SSHD7/id_rsa.pub"
+in_shell /tmp/c-sshmodes/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD7" >/dev/null
+check "public key is restored to 644, not 600" "$(stat -c %a "$SSHD7/id_rsa.pub")" "644"
+
+# Repairing a mode needs no key material, so it must work with no server at
+# all — which is exactly when a laptop most needs its key to be usable.
+SSHD8=/tmp/c-sshdir-modes-offline
+rm -rf /tmp/c-sshmodesoff "$SSHD8"
+in_shell /tmp/c-sshmodesoff/env 'true' INFISICAL_SSH_DIR="$SSHD8" >/dev/null
+loosen "$SSHD8"
+in_shell /tmp/c-sshmodesoff/env 'true' INFISICAL_SSH_DIR="$SSHD8" \
+  STUB_INFISICAL_FAIL=1 >/dev/null
+check "offline shell tightens the key" "$(stat -c %a "$SSHD8/id_rsa")" "600"
+check "and the directory" "$(stat -c %a "$SSHD8")" "700"
+
+loosen "$SSHD8"
+in_shell /tmp/c-sshmodesoff/env 'true' INFISICAL_SSH_DIR="$SSHD8" \
+  STUB_INFISICAL_EXPIRED=1 >/dev/null
+check "expired session tightens the key" "$(stat -c %a "$SSHD8/id_rsa")" "600"
+
+# Cheap enough to do on every shell only if it stays local: no network call.
+before=$(grep -c -- '--path=/ssh' /tmp/c-sshrestore2/log)
+loosen /tmp/c-sshdir-restore2
+in_shell /tmp/c-sshrestore2/env 'true' $TTL INFISICAL_SSH_DIR=/tmp/c-sshdir-restore2 \
+  STUB_INFISICAL_CALLS=/tmp/c-sshrestore2/log >/dev/null
+after=$(grep -c -- '--path=/ssh' /tmp/c-sshrestore2/log)
+check "repairing a mode does not call the server" "$(( after - before ))" "0"
+
+# Files this integration never wrote are none of its business, whatever their
+# mode: ~/.ssh routinely holds keys that came from somewhere else.
+print 'not ours' > "$SSHD7/id_ed25519"
+chmod 644 "$SSHD7/id_ed25519"
+in_shell /tmp/c-sshmodes/env 'true' $TTL INFISICAL_SSH_DIR="$SSHD7" >/dev/null
+check "a file we never wrote is left alone" "$(stat -c %a "$SSHD7/id_ed25519")" "644"
+
 print "== ssh file names cannot escape =="
 
 SSHD2=/tmp/c-sshdir-hostile

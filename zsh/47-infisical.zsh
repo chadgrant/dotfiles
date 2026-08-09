@@ -15,8 +15,11 @@
 # the root path become environment variables. Secrets in the ssh folder become
 # files in ~/.ssh, one per secret, named by the secret's key: "id_rsa.pub"
 # becomes ~/.ssh/id_rsa.pub. Public keys are written 644 and everything else
-# 600. ~/.ssh is rewritten whenever the cache is refetched, so local edits to
-# files that are also in the project do not survive.
+# 600, and ~/.ssh itself 700. ~/.ssh is rewritten whenever the cache is
+# refetched, so local edits to files that are also in the project do not
+# survive. Those modes are re-asserted on every shell, whether or not anything
+# was fetched, because ssh refuses a key that others can read and a mode
+# loosened behind our back needs no network call to put right.
 #
 # The project holds one environment per machine, slugged with that machine's
 # short hostname. A machine with no environment of its own gets "default", so a
@@ -77,6 +80,10 @@
 # ssh accepts for all of them, so the default needs no per-name exceptions.
 : ${INFISICAL_SSH_PUBLIC_MODE:=644}
 : ${INFISICAL_SSH_PRIVATE_MODE:=600}
+
+# ssh refuses to use a private key from a directory others can reach, so the
+# directory has a mode of its own to enforce alongside the files'.
+: ${INFISICAL_SSH_DIR_MODE:=700}
 
 # Names matching this never become environment variables. The SSH keys share the
 # root path with the shell variables — `infisical secrets folders create` does
@@ -255,6 +262,19 @@ _infisical_ssh_name_ok() {
 # that a deleted key can be noticed without asking the server.
 _infisical_ssh_manifest=${INFISICAL_CACHE:h}/ssh-manifest
 
+# The mode a key file belongs at, decided by its name alone. One definition
+# because two things need the answer: the sync that writes the file, and the
+# repair that puts a loosened mode back.
+#
+# Answers in REPLY rather than on stdout: this runs once per file on the
+# shell-startup path, where a command substitution would mean a fork per file.
+_infisical_ssh_mode_for() {
+  case $1 in
+    *.pub) REPLY=$INFISICAL_SSH_PUBLIC_MODE ;;
+    *)     REPLY=$INFISICAL_SSH_PRIVATE_MODE ;;
+  esac
+}
+
 # True when a file the last sync wrote is no longer on disk.
 #
 # Deleting ~/.ssh/id_rsa does not make the secrets cache stale, so without this
@@ -271,6 +291,37 @@ _infisical_ssh_files_missing() {
   done < $_infisical_ssh_manifest
 
   return 1
+}
+
+# Puts the modes back on the files the last sync wrote.
+#
+# ssh refuses a key others can read, so a file sitting at the wrong mode is as
+# unusable as one that is missing. Modes used to be set only as a side effect
+# of *writing* a file, which left nothing enforcing them on the shells that
+# write nothing — a fresh cache, an unreachable server, an expired session — so
+# a key loosened by a restored backup or a stray tool stayed loosened.
+#
+# Unlike a missing file this needs no key material, only chmod, so it is done
+# locally on every shell including the offline ones, which is exactly when a
+# laptop most needs its key to still work. The manifest bounds it to the files
+# this integration wrote: the rest of ~/.ssh came from somewhere else and its
+# modes are not ours to decide.
+_infisical_ssh_repair_modes() {
+  [[ -r $_infisical_ssh_manifest && -d "$INFISICAL_SSH_DIR" ]] || return 0
+
+  chmod "$INFISICAL_SSH_DIR_MODE" "$INFISICAL_SSH_DIR" \
+    || print -u2 "ssh: cannot set mode $INFISICAL_SSH_DIR_MODE on $INFISICAL_SSH_DIR"
+
+  # REPLY is local so _infisical_ssh_mode_for cannot leak it into the shell.
+  local name REPLY
+  while IFS= read -r name; do
+    [[ -n $name && -f "$INFISICAL_SSH_DIR/$name" ]] || continue
+    _infisical_ssh_mode_for "$name"
+    chmod "$REPLY" "$INFISICAL_SSH_DIR/$name" \
+      || print -u2 "ssh: cannot set mode $REPLY on $name"
+  done < $_infisical_ssh_manifest
+
+  return 0
 }
 
 # Writes one file at its final mode before any key material reaches it, then
@@ -328,12 +379,12 @@ _infisical_ssh_sync() {
     names=( ${(f)"$(jq -r '.[].key' < "$json" 2>/dev/null)"} )
     (( ${#names} )) || return 2
 
-    # Created at 700 and enforced at 700: ssh refuses to use a private key from
-    # a directory others can reach.
-    mkdir -p -m 700 "$INFISICAL_SSH_DIR" || return 1
-    chmod 700 "$INFISICAL_SSH_DIR" || return 1
+    # Created at its mode and enforced at it: ssh refuses to use a private key
+    # from a directory others can reach.
+    mkdir -p -m "$INFISICAL_SSH_DIR_MODE" "$INFISICAL_SSH_DIR" || return 1
+    chmod "$INFISICAL_SSH_DIR_MODE" "$INFISICAL_SSH_DIR" || return 1
 
-    local name mode
+    local name mode REPLY
     local -a wrote written_names
     local -i failed=0
     for name in $names; do
@@ -343,10 +394,8 @@ _infisical_ssh_sync() {
         continue
       fi
 
-      case $name in
-        *.pub) mode=$INFISICAL_SSH_PUBLIC_MODE ;;
-        *)     mode=$INFISICAL_SSH_PRIVATE_MODE ;;
-      esac
+      _infisical_ssh_mode_for "$name"
+      mode=$REPLY
 
       if _infisical_ssh_write "$name" "$json" "$mode"; then
         wrote+=( "$name ($mode)" )
@@ -456,22 +505,25 @@ secrets-forget() {
 _infisical_load_at_startup() {
   _infisical_is_configured || return 0
 
-  local -i rc=0
+  local -i rc=0 fetched=0
   if ! _infisical_cache_is_fresh; then
     _infisical_write_cache
     rc=$?
+    (( rc == 0 )) && fetched=1
+  fi
 
-    # Tied to the refetch rather than to every shell: ~/.ssh is rewritten on
-    # the same 12h cadence as the cache, so a new machine gets its keys at
-    # first shell without every shell paying for it. The environment is taken
-    # from the cache just written, so files and variables always agree.
-    (( rc == 0 )) && _infisical_ssh_sync "$(_infisical_cache_env)"
-  elif _infisical_ssh_files_missing; then
-    # A deleted key is the one case worth a network call on an otherwise fresh
-    # cache: the shell is the only thing that puts it back, and waiting for the
-    # cache to age out would leave the machine without a key until it did.
+  # Only key material needs the server, so only two things are worth a fetch:
+  # a refetch that may have changed the keys, and a deleted file, which the
+  # shell is the only thing that puts back — waiting for the cache to age out
+  # would leave the machine without a key until it did. The environment comes
+  # from the cache just written, so files and variables always agree.
+  if (( fetched )) || _infisical_ssh_files_missing; then
     _infisical_ssh_sync "$(_infisical_cache_env)"
   fi
+
+  # Modes, by contrast, are ours to fix without asking anyone, so they are
+  # enforced on every shell — including the ones above that fetched nothing.
+  _infisical_ssh_repair_modes
 
   # An expired session is only worth a word once the cached values have loaded;
   # with no cache at all the message below already says to log in.
