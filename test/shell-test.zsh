@@ -48,6 +48,16 @@ check "fragments after 47 still apply" "$out" "gs='git status'"
 out=$(in_shell /tmp/c-fn 'whence -w secrets-refresh secrets-status secrets-forget | wc -l | tr -d " "')
 check "helper commands defined" "$out" "3"
 
+print "== bare infisical login finds the server =="
+
+# printenv rather than a parameter expansion: the CLI is a child process, so
+# only an exported value counts.
+out=$(in_shell /tmp/c-url 'printenv INFISICAL_API_URL')
+check "INFISICAL_API_URL exported" "$out" "https://infisical.deviantgeek.io"
+
+out=$(in_shell /tmp/c-url3 'printenv INFISICAL_API_URL' INFISICAL_API_URL=https://pinned.example.test)
+check "an INFISICAL_API_URL set beforehand is kept" "$out" "https://pinned.example.test"
+
 print "== empty project id disables the integration =="
 
 rm -rf /tmp/c-none

@@ -29,11 +29,12 @@
 #
 # Anything in ~/.extra is sourced later and therefore wins over these values.
 #
-# INFISICAL_DOMAIN only takes effect at `infisical login` time (see setup.sh).
-# Once logged in the CLI uses the domain it recorded and ignores both --domain
-# and INFISICAL_API_URL, so `secrets-status` reports the recorded one.
-
-: ${INFISICAL_DOMAIN:=https://infisical.deviantgeek.io}
+# INFISICAL_API_URL is the CLI's own variable, exported so a bare `infisical
+# login` goes to this server instead of asking which one. It only takes effect
+# at login time: once logged in the CLI uses the domain it recorded and ignores
+# this, so `secrets-status` reports the recorded one. setup.sh writes the same
+# export for bash.
+export INFISICAL_API_URL=${INFISICAL_API_URL:-https://infisical.deviantgeek.io}
 
 # Assigned only when unset, so exporting an empty INFISICAL_PROJECT_ID before
 # the shell starts turns Infisical off for that machine. Using := here would
@@ -110,17 +111,13 @@ _infisical_run() {
   fi
 }
 
-# The CLI ignores --domain for user logins and always talks to whatever
-# `infisical login` recorded, so hints and status must report that one.
+# The CLI always talks to whatever `infisical login` recorded, so status must
+# report that one.
 _infisical_recorded_domain() {
   local domain=$(jq -r '.LoggedInUserDomain // empty' \
     "$HOME/.infisical/infisical-config.json" 2>/dev/null)
   domain=${domain%/api}
-  print -r -- "${domain:-$INFISICAL_DOMAIN}"
-}
-
-_infisical_login_hint() {
-  print -r -- "infisical login --domain=$(_infisical_recorded_domain)"
+  print -r -- "${domain:-$INFISICAL_API_URL}"
 }
 
 # With no valid session `infisical export` does not simply fail — it drops into
@@ -205,7 +202,6 @@ _infisical_fetch_env() {
     # front of every shell. Here it lands in a file nobody reads, jq's own
     # complaint is silenced, and the exit status does the talking.
     _infisical_run export --silent --format=json \
-        --domain="$INFISICAL_DOMAIN" \
         --projectId="$INFISICAL_PROJECT_ID" \
         --path=/ \
         --env="$env" \
@@ -369,7 +365,6 @@ _infisical_ssh_sync() {
 
     setopt localoptions pipefail
     _infisical_run export --silent --format=json \
-        --domain="$INFISICAL_DOMAIN" \
         --projectId="$INFISICAL_PROJECT_ID" \
         --path="$INFISICAL_SSH_PATH" \
         --env="$env" \
@@ -429,7 +424,7 @@ secrets-ssh-sync() {
   fi
 
   if ! _infisical_has_session; then
-    print -u2 "ssh: Infisical session expired — run: $(_infisical_login_hint)"
+    print -u2 "ssh: Infisical session expired — run: infisical login"
     return 1
   fi
 
@@ -454,7 +449,7 @@ secrets-refresh() {
   _infisical_write_cache
   case $? in
     0) ;;
-    2) print -u2 "secrets: Infisical session expired — run: $(_infisical_login_hint)"
+    2) print -u2 "secrets: Infisical session expired — run: infisical login"
        return 1 ;;
     *) print -u2 "secrets: export failed — check the server, project id and env"
        return 1 ;;
@@ -495,7 +490,7 @@ secrets-status() {
 
   print "secrets: $count entries, $freshness, session $session, from $(_infisical_recorded_domain)"
   print "  environment: $env ($origin)"
-  [[ $session == valid ]] || print "  run: $(_infisical_login_hint)"
+  [[ $session == valid ]] || print "  run: infisical login"
 }
 
 secrets-forget() {
@@ -528,9 +523,9 @@ _infisical_load_at_startup() {
   # An expired session is only worth a word once the cached values have loaded;
   # with no cache at all the message below already says to log in.
   if ! _infisical_load_cache; then
-    print -u2 "secrets: no Infisical cache — run: $(_infisical_login_hint) && secrets-refresh"
+    print -u2 "secrets: no Infisical cache — run: infisical login && secrets-refresh"
   elif (( rc == 2 )); then
-    print -u2 "secrets: Infisical session expired, using cached values — run: $(_infisical_login_hint)"
+    print -u2 "secrets: Infisical session expired, using cached values — run: infisical login"
   fi
 }
 

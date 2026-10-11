@@ -12,7 +12,7 @@ esac
 
 # Self-hosted Infisical instance that supplies this machine's secrets and keys.
 # Project "secret-management"; override any of these to bootstrap from elsewhere.
-INFISICAL_DOMAIN="${INFISICAL_DOMAIN:-https://infisical.deviantgeek.io}"
+INFISICAL_API_URL="${INFISICAL_API_URL:-https://infisical.deviantgeek.io}"
 INFISICAL_PROJECT_ID="${INFISICAL_PROJECT_ID:-3abbe79b-4cd2-4e68-9e76-4e59d8865f92}"
 
 # The project holds one environment per machine, slugged with that machine's
@@ -106,12 +106,27 @@ else
   as_user infisical vault set file
 fi
 
-printf '\n\nLogging into Infisical (%s) ...\n' "$INFISICAL_DOMAIN"
+# zsh exports INFISICAL_API_URL from zsh/47-infisical.zsh; bash has no fragment
+# of ours to carry it, so it is appended here. Both files, because a login bash
+# reads ~/.bash_profile and stops there — the keychain line below creates one
+# on Linux, which keeps ~/.profile from pulling in ~/.bashrc — while every
+# other interactive bash reads only ~/.bashrc.
+for bash_startup_file in "$TARGET_HOME/.bashrc" "$TARGET_HOME/.bash_profile"; do
+  if ! grep -q 'INFISICAL_API_URL' "$bash_startup_file" 2>/dev/null; then
+    as_user tee -a "$bash_startup_file" >/dev/null <<EOF
+
+# Lets a bare \`infisical login\` find the self-hosted server
+export INFISICAL_API_URL="$INFISICAL_API_URL"
+EOF
+  fi
+done
+
+printf '\n\nLogging into Infisical (%s) ...\n' "$INFISICAL_API_URL"
 printf 'This is the only interactive login; the CLI refreshes itself afterwards.\n\n'
 
-if ! as_user infisical login --domain="$INFISICAL_DOMAIN"; then
+if ! as_user infisical login --domain="$INFISICAL_API_URL"; then
   echo "Infisical login did not complete. Run this, then re-run setup.sh:" >&2
-  echo "  infisical login --domain=$INFISICAL_DOMAIN" >&2
+  echo "  infisical login --domain=$INFISICAL_API_URL" >&2
   exit 1
 fi
 
@@ -121,7 +136,7 @@ if [ -z "${INFISICAL_ENV:-}" ]; then
   for candidate in "$INFISICAL_HOST_ENV" "$INFISICAL_ENV_FALLBACK"; do
     [ -n "$candidate" ] || continue
     if as_user infisical export --silent --format=json \
-         --domain="$INFISICAL_DOMAIN" \
+         --domain="$INFISICAL_API_URL" \
          --projectId="$INFISICAL_PROJECT_ID" \
          --path="$INFISICAL_SSH_PATH" \
          --env="$candidate" >/dev/null 2>&1; then
@@ -156,7 +171,7 @@ sync_ssh_folder() {
   # `infisical secrets get --path` 404s against this server while `export`
   # reads the same folder correctly, so everything is pulled from the JSON.
   if ! as_user infisical export --silent --format=json \
-        --domain="$INFISICAL_DOMAIN" \
+        --domain="$INFISICAL_API_URL" \
         --projectId="$INFISICAL_PROJECT_ID" \
         --path="$INFISICAL_SSH_PATH" \
         --env="$INFISICAL_ENV" >"$json" 2>/dev/null; then
