@@ -40,6 +40,19 @@ if type "eza" > /dev/null 2>&1; then
   alias tree='eza -T --git'
 fi
 
-if type "keychain" > /dev/null; then
-  eval `keychain --eval --agents ssh id_rsa`
+# One ssh-agent: the systemd user agent at ~/.ssh/agent.sock, which ~/.ssh/config
+# pins for every ssh and git. Load the key into that agent, once per boot, in the
+# first interactive shell. keychain starts an agent of its own, so it held the key
+# while every ssh asked the empty pinned agent; it is now only the fallback for a
+# machine without the systemd agent.
+ssh_agent_socket="$HOME/.ssh/agent.sock"
+if [[ -S $ssh_agent_socket ]]; then
+  export SSH_AUTH_SOCK=$ssh_agent_socket
+  unset SSH_AGENT_PID
+  if [[ -o interactive ]] && ! ssh-add -l > /dev/null 2>&1; then
+    ssh-add "$HOME/.ssh/id_rsa"
+  fi
+elif type "keychain" > /dev/null; then
+  eval "$(keychain --eval --agents ssh id_rsa)"
 fi
+unset ssh_agent_socket
