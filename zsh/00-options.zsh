@@ -27,6 +27,14 @@ if [ "${WSL_DISTRO_NAME}x" != "x" ]; then
   WSL=true
 fi
 
+# Docker writes /.dockerenv into every container, Podman /run/.containerenv.
+# An image built with `setup.sh --container` carries only what a session
+# needs, so fragments use this to stay quiet about what it leaves out.
+CONTAINER=false
+if [[ -e /.dockerenv || -e /run/.containerenv ]]; then
+  CONTAINER=true
+fi
+
 USEPOWER9k=false
 
 if [[ "${ITERM}" = true || "${LINUX}" = true || "${MACOS}" = true ]]; then

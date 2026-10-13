@@ -12,4 +12,8 @@ _dotnet_zsh_complete()
   _values = "${(ps:\n:)completions}"
 }
 
-compdef _dotnet_zsh_complete dotnet 2>/dev/null
+# compdef exists only once compinit has run, which prezto does; a shell
+# without prezto (a container's fresh home) has no completion system to join.
+if (( $+functions[compdef] )); then
+  compdef _dotnet_zsh_complete dotnet
+fi

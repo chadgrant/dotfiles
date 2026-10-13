@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage:
+#   setup.sh              set up this workstation (macOS, Debian/Ubuntu); interactive
+#   setup.sh --container  install the shell's tools into a Debian/Ubuntu image
+#                         during `docker build`; non-interactive, run as root
+#
+# --container is one half of the contract Remote AI's Docker sessions rely on;
+# container-init.sh, run as the session user when the container starts, is the
+# other. See setup_container below for what it leaves out and why.
+CONTAINER=false
+case "${1:-}" in
+  "") ;;
+  --container) CONTAINER=true ;;
+  *) echo "Usage: $0 [--container]" >&2
+     exit 2 ;;
+esac
+
 OS="$(uname)"
 MACHINE="$(uname -m)"
 # normalized arch: amd64 / arm64
@@ -42,6 +58,79 @@ fi
 : "${TARGET_HOME:=$HOME}"
 
 as_user() { sudo -u "$TARGET_USER" HOME="$TARGET_HOME" "$@"; }
+
+# Runs a command as root: through sudo on a workstation, directly when already
+# root, as a container build is, which has no sudo installed to call. The
+# arguments are sudo's, so a leading -E (keep the caller's environment) is
+# dropped there: root running the command itself keeps that environment anyway.
+as_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    sudo "$@"
+    return
+  fi
+  if [ "${1:-}" = "-E" ]; then
+    shift
+  fi
+  "$@"
+}
+
+# Shared by the workstation and container paths, so both get the CLI the same
+# way: the vendor's apt repo on Debian/Ubuntu, its tap on macOS.
+install_infisical_cli() {
+  printf '\n\nInstalling Infisical CLI ...\n\n'
+
+  if [ "$OS" = "Linux" ]; then
+    curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | as_root -E bash
+    as_root apt-get update && as_root apt-get install -y infisical
+  elif [ "$OS" = "Darwin" ]; then
+    brew install infisical/get-cli/infisical
+  fi
+}
+
+# Runs as root inside `docker build`, so there is no sudo, no terminal, and no
+# user yet: the uid and HOME a session runs as are only decided at `docker run`,
+# and HOME may be a tmpfs or the server's real home bind-mounted in. Only
+# system-wide tools are installed here. Everything per-user — the ~/.zshrc
+# link, the Infisical login, ssh keys, git identity — is left to
+# container-init.sh at start or to the server's own mounts. Skipped outright,
+# because an image has no use for them or nobody to answer them: apt upgrade
+# (the base image's job), the timezone prompt, sshd, docker, kubectl, node
+# (the base image ships it), and every prompt in the workstation path below.
+setup_container() {
+  if [ "$OS" != "Linux" ] || ! command -v apt-get >/dev/null 2>&1; then
+    echo "setup.sh --container needs a Debian or Ubuntu image." >&2
+    exit 1
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "setup.sh --container runs as root, as a docker build RUN step does." >&2
+    exit 1
+  fi
+
+  # A debconf question (tzdata is the usual one) would hang a build that has
+  # nobody to answer it.
+  export DEBIAN_FRONTEND=noninteractive
+
+  printf '\n\nInstalling container packages ...\n\n'
+
+  # zsh, plus what its fragments call while starting: git (80-git), jq
+  # (47-infisical), direnv (50-direnv). curl and ca-certificates fetch the
+  # Infisical repo script. openssh-client because 80-git rewrites GitHub https
+  # URLs to ssh, so any clone in a session goes over ssh. Recommends are left
+  # out to keep the layer small.
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl git jq zsh direnv openssh-client
+
+  install_infisical_cli
+
+  # Only needed while installing; kept, they bloat every image built on this.
+  rm -rf /var/lib/apt/lists/*
+}
+
+if [ "$CONTAINER" = true ]; then
+  setup_container
+  exit 0
+fi
 
 if [ "$OS" = "Linux" ]; then
   sudo apt-get update
@@ -89,14 +178,7 @@ fi
 # Must precede SSH setup: the private key, and every later `git clone` over
 # ssh, come out of Infisical.
 
-printf '\n\nInstalling Infisical CLI ...\n\n'
-
-if [ "$OS" = "Linux" ]; then
-  curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
-  sudo apt-get update && sudo apt-get install -y infisical
-elif [ "$OS" = "Darwin" ]; then
-  brew install infisical/get-cli/infisical
-fi
+install_infisical_cli
 
 # On macOS the login token belongs in the Keychain. Linux and WSL have no
 # keyring daemon, so they keep the encrypted file backend.

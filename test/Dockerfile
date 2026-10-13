@@ -32,4 +32,9 @@ COPY test/shell-test.zsh /opt/test/shell-test.zsh
 USER tester
 WORKDIR /home/tester
 
+# The suite runs inside a container, where 47-infisical stays silent and
+# fetches nothing unless the server mounted its ~/.infisical in. The directory
+# stands in for that mount; the stub CLI needs nothing inside it.
+RUN mkdir /home/tester/.infisical
+
 CMD ["zsh", "/opt/test/shell-test.zsh"]

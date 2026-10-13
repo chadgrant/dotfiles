@@ -8,16 +8,19 @@ elif type "bat" > /dev/null 2>&1; then
   alias catcat='/bin/cat'
 fi
 
+# A container image leaves fzf and fd out on purpose, so their absence there
+# is not news worth a line on every start.
+
 #fzf
 if ! type "fzf" > /dev/null; then
-  echo "fzf missing"
+  [ "${CONTAINER}" = true ] || echo "fzf missing"
 else
   eval "$(fzf --zsh)"
 fi
 
 #fd
 if ! type "fd" > /dev/null; then
-  echo "fd not installed"
+  [ "${CONTAINER}" = true ] || echo "fd not installed"
 else
   export FZF_DEFAULT_COMMAND="fd --hidden --strip-cwd-prefix --exclude .git"
   export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"

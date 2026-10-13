@@ -69,6 +69,19 @@ check "no token in environment" \
   "$(env INFISICAL_CACHE=/tmp/c-none/env INFISICAL_PROJECT_ID= \
      zsh -c "source $ZSHRC >/dev/null 2>&1; print \${GITHUB_TOKEN:-unset}" 2>/dev/null)" "unset"
 
+print "== a container given no Infisical login stays quiet =="
+
+# The suite itself runs in a container, so a home without ~/.infisical is
+# exactly a session whose server mounted no login in. Only the secrets lines
+# are counted: this image has no git, so 80-git complains on its own account.
+rm -rf /tmp/c-nologin; mkdir -p /tmp/c-nologin/home
+out=$(env HOME=/tmp/c-nologin/home INFISICAL_CACHE=/tmp/c-nologin/env \
+  INFISICAL_PROJECT_ID="$PROJECT" STUB_INFISICAL_CALLS=/tmp/c-nologin/log \
+  zsh -c "source $ZSHRC 2>&1 >/dev/null" | grep -c '^secrets:')
+check "no login hint on stderr" "$out" "0"
+check "the CLI is never called" \
+  "$([[ -e /tmp/c-nologin/log ]] && print called || print not-called)" "not-called"
+
 print "== fetch and cache =="
 
 rm -rf /tmp/c-ok

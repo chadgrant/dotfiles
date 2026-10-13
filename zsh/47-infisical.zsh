@@ -500,6 +500,12 @@ secrets-forget() {
 _infisical_load_at_startup() {
   _infisical_is_configured || return 0
 
+  # A container has a login only when the server mounted its ~/.infisical in.
+  # Without one there is no session to use, the fetch could only fail, and the
+  # "run infisical login" hint below would greet every start of an image that
+  # was simply never given secrets.
+  [[ $CONTAINER == true && ! -d $HOME/.infisical ]] && return 0
+
   local -i rc=0 fetched=0
   if ! _infisical_cache_is_fresh; then
     _infisical_write_cache

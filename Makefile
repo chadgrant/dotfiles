@@ -1,4 +1,4 @@
-.PHONY: test test-shell
+.PHONY: test test-shell test-container test-init
 
 # Interactive container for exercising setup.sh by hand.
 test:
@@ -10,3 +10,17 @@ test:
 test-shell:
 	docker build -f test/Dockerfile -t dotfiles-shell-test .
 	docker run --rm dotfiles-shell-test
+
+# Proves the two container entry points: builds the image a Remote AI Docker
+# session would get (setup.sh --container), then starts a shell in it as an
+# arbitrary uid with HOME on an empty tmpfs (container-init.sh, then zsh -i).
+# Fails if shell start writes anything to stderr. The last line of output on
+# success is "zsh direnv infisical jq ok".
+test-container:
+	docker build -f test/container.Dockerfile -t dotfiles-container-test .
+	docker run --rm --user 1000:1000 -e HOME=/home/u --tmpfs /home/u:mode=1777 dotfiles-container-test
+
+# container-init.sh against empty, already-initialised and bind-mounted homes.
+# Plain bash, no Docker.
+test-init:
+	bash test/container-init-test.sh
