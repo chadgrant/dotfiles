@@ -69,18 +69,31 @@ check "no token in environment" \
   "$(env INFISICAL_CACHE=/tmp/c-none/env INFISICAL_PROJECT_ID= \
      zsh -c "source $ZSHRC >/dev/null 2>&1; print \${GITHUB_TOKEN:-unset}" 2>/dev/null)" "unset"
 
-print "== a container given no Infisical login stays quiet =="
+print "== no Infisical login: quiet in a container, a hint on a host =="
 
-# The suite itself runs in a container, so a home without ~/.infisical is
-# exactly a session whose server mounted no login in. Only the secrets lines
-# are counted: this image has no git, so 80-git complains on its own account.
-rm -rf /tmp/c-nologin; mkdir -p /tmp/c-nologin/home
-out=$(env HOME=/tmp/c-nologin/home INFISICAL_CACHE=/tmp/c-nologin/env \
-  INFISICAL_PROJECT_ID="$PROJECT" STUB_INFISICAL_CALLS=/tmp/c-nologin/log \
-  zsh -c "source $ZSHRC 2>&1 >/dev/null" | grep -c '^secrets:')
-check "no login hint on stderr" "$out" "0"
-check "the CLI is never called" \
+# Both cases get the same home with no ~/.infisical and a CLI whose session
+# has expired; only where the shell runs differs. CONTAINER_MARKERS decides
+# that explicitly, since the suite itself always runs in a container: any file
+# that exists makes this one, a path that does not makes it a host. Only the
+# secrets lines are counted: this image has no git, so 80-git complains on its
+# own account.
+no_login() {
+  local dir=$1 markers=$2
+  rm -rf "$dir"; mkdir -p "$dir/home"
+  env HOME="$dir/home" INFISICAL_CACHE="$dir/env" INFISICAL_PROJECT_ID="$PROJECT" \
+    STUB_INFISICAL_EXPIRED=1 STUB_INFISICAL_CALLS="$dir/log" \
+    CONTAINER_MARKERS="$markers" \
+    zsh -c "source $ZSHRC 2>&1 >/dev/null" | grep '^secrets:'
+}
+
+out=$(no_login /tmp/c-nologin "$ZSHRC")
+check "a container says nothing" "$out" ""
+check "and never calls the CLI" \
   "$([[ -e /tmp/c-nologin/log ]] && print called || print not-called)" "not-called"
+
+out=$(no_login /tmp/c-hostnologin /nonexistent/container-marker)
+check "a host still says to log in" \
+  "$(print -r -- "$out" | grep -c 'no Infisical cache — run: infisical login')" "1"
 
 print "== fetch and cache =="
 

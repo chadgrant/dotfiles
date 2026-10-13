@@ -13,12 +13,14 @@ test-shell:
 
 # Proves the two container entry points: builds the image a Remote AI Docker
 # session would get (setup.sh --container), then starts a shell in it as an
-# arbitrary uid with HOME on an empty tmpfs (container-init.sh, then zsh -i).
-# Fails if shell start writes anything to stderr. The last line of output on
-# success is "zsh direnv infisical jq ok".
+# arbitrary uid with HOME on an empty tmpfs (container-init.sh, then zsh -i),
+# once linking ~/.zshrc and once with a ZDOTDIR, as Remote AI passes when HOME
+# is the server's own. Fails if shell start writes anything to stderr. The
+# last line of output of each run on success is "zsh direnv infisical jq ok".
 test-container:
 	docker build -f test/container.Dockerfile -t dotfiles-container-test .
 	docker run --rm --user 1000:1000 -e HOME=/home/u --tmpfs /home/u:mode=1777 dotfiles-container-test
+	docker run --rm --user 1000:1000 -e HOME=/home/u -e ZDOTDIR=/home/u/.zdot --tmpfs /home/u:mode=1777 dotfiles-container-test
 
 # container-init.sh against empty, already-initialised and bind-mounted homes.
 # Plain bash, no Docker.

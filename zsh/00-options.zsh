@@ -30,10 +30,13 @@ fi
 # Docker writes /.dockerenv into every container, Podman /run/.containerenv.
 # An image built with `setup.sh --container` carries only what a session
 # needs, so fragments use this to stay quiet about what it leaves out.
+# CONTAINER_MARKERS replaces the list, so the test suite, which itself runs in
+# a container, can exercise the host path too.
 CONTAINER=false
-if [[ -e /.dockerenv || -e /run/.containerenv ]]; then
-  CONTAINER=true
-fi
+for marker in ${=CONTAINER_MARKERS:-/.dockerenv /run/.containerenv}; do
+  [[ -e $marker ]] && CONTAINER=true
+done
+unset marker
 
 USEPOWER9k=false
 
